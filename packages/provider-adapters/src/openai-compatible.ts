@@ -76,7 +76,8 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
         signal: AbortSignal.timeout(this.metaTimeoutMs),
       });
     } catch (e) {
-      throw new ProviderError(`request failed: ${(e as Error).name}`, "unavailable");
+      const name = (e as Error).name;
+      throw new ProviderError(name === "TimeoutError" ? "timed out" : "connection failed", "unavailable");
     }
     if (!res.ok) throw new ProviderError(`HTTP ${res.status}`, "http_error", res.status);
     try {
@@ -157,7 +158,8 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     let finish: "stop" | "length" | "error" = "stop";
     let usage: { promptTokens?: number; completionTokens?: number } | undefined;
     try {
-      for await (const data of readSse(res.body)) {
+      for await (const data of readSse(res.body, signal)) {
+        if (signal.aborted) throw new ProviderError("aborted", "aborted");
         if (data === "[DONE]") break;
         let obj: {
           choices?: { delta?: Record<string, unknown>; finish_reason?: string | null }[];
@@ -175,7 +177,12 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
         }
         const choice = obj.choices?.[0];
         if (!choice) continue;
-        if (choice.delta) yield* this.parseDelta(choice.delta);
+        if (choice.delta) {
+          for (const c of this.parseDelta(choice.delta)) {
+            if (signal.aborted) throw new ProviderError("aborted", "aborted");
+            yield c;
+          }
+        }
         if (choice.finish_reason === "length") finish = "length";
       }
     } catch (e) {

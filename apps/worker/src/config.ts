@@ -52,7 +52,7 @@ export const ConfigSchema = z.object({
       maxMessages: z.number().int().min(1).default(200),
       maxResponseChars: z.number().int().min(100).default(200_000),
       /** Upper bound applied to max_tokens; also used when the client sends none. */
-      maxTokens: z.number().int().min(1).default(4096),
+      maxTokens: z.number().int().min(1).default(8192),
     })
     .prefault({}),
   streaming: z

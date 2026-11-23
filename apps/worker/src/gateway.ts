@@ -10,7 +10,7 @@ import {
   type WorkerDraft,
 } from "@relayllm/protocol";
 import { ProviderError, type ChatRequest, type ProviderAdapter, type ProviderModel } from "@relayllm/provider-adapters";
-import type { IncomingMessage } from "@relayllm/nostr-transport";
+import { hexToNpub, type IncomingMessage } from "@relayllm/nostr-transport";
 import { addPending, authorize, DailyQuota, RateLimiter, redeemInvite, type Authorization } from "./access.ts";
 import type { Config } from "./config.ts";
 import type { Logger } from "./log.ts";
@@ -196,7 +196,7 @@ export class Gateway {
       added = addPending(cfg, sender, m.label);
     });
     if (added) {
-      this.#d.log.info("access requested — approve with: relayllm users approve <npub>", { user: short(sender) });
+      this.#d.log.info(`access requested — approve with: relayllm users approve ${hexToNpub(sender)}`, { label: m.label });
     }
     return this.#reply(replyTo, { type: "pair.result", re: m.id, status: "pending" });
   }

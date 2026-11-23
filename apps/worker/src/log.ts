@@ -20,7 +20,9 @@ function fmt(meta?: Record<string, unknown>): string {
   const parts: string[] = [];
   for (const [k, v] of Object.entries(meta)) {
     if (v === undefined) continue;
-    const val = REDACT.test(k) && typeof v === "string" ? "[redacted]" : typeof v === "string" ? v : JSON.stringify(v);
+    const raw = REDACT.test(k) && typeof v === "string" ? "[redacted]" : typeof v === "string" ? v : JSON.stringify(v);
+    // Values may originate from remote users: strip control chars (ANSI escapes etc.).
+    const val = String(raw).replace(/[\u0000-\u001f\u007f-\u009f]/g, "?").slice(0, 200);
     parts.push(`${k}=${val}`);
   }
   return parts.length ? ` ${parts.join(" ")}` : "";
