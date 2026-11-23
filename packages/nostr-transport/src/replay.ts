@@ -10,15 +10,22 @@ export class ReplayGuard {
   readonly #maxAgeSec: number;
   readonly #maxSkewSec: number;
   readonly #maxEntries: number;
+  readonly #notBefore: number;
 
-  constructor(opts: { maxAgeSec?: number; maxSkewSec?: number; maxEntries?: number } = {}) {
-    this.#maxAgeSec = opts.maxAgeSec ?? 120;
-    this.#maxSkewSec = opts.maxSkewSec ?? 30;
+  /**
+   * `notBefore` (unix seconds): reject anything created earlier. Set it to the
+   * process start time so events captured before a restart (when the seen-id
+   * cache was empty) cannot be replayed.
+   */
+  constructor(opts: { maxAgeSec?: number; maxSkewSec?: number; maxEntries?: number; notBefore?: number } = {}) {
+    this.#maxAgeSec = opts.maxAgeSec ?? 180;
+    this.#maxSkewSec = opts.maxSkewSec ?? 90;
     this.#maxEntries = opts.maxEntries ?? 100_000;
+    this.#notBefore = opts.notBefore ?? 0;
   }
 
   check(id: string, createdAt: number, now = Math.floor(Date.now() / 1000)): "ok" | "stale" | "future" | "replay" {
-    if (createdAt < now - this.#maxAgeSec) return "stale";
+    if (createdAt < now - this.#maxAgeSec || createdAt < this.#notBefore) return "stale";
     if (createdAt > now + this.#maxSkewSec) return "future";
     this.#prune(now);
     if (this.#seen.has(id)) return "replay";

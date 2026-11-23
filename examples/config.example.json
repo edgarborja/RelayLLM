@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "Home Mac Mini",
+  "keyStorage": "keychain",
+  "provider": {
+    "kind": "lmstudio",
+    "baseUrl": "http://localhost:1234/v1",
+    "allowRemoteEndpoint": false,
+    "streaming": true,
+    "hasApiKey": false
+  },
+  "models": {
+    "exposed": ["qwen/qwen3.5-9b"],
+    "manual": []
+  },
+  "relays": ["wss://relay.k1.sv", "wss://nos.lol"],
+  "clientUrl": "https://YOUR-USER.github.io/relayllm/",
+  "access": {
+    "mode": "private",
+    "users": [],
+    "pending": [],
+    "invites": []
+  },
+  "limits": {
+    "maxConcurrent": 2,
+    "perUserConcurrent": 1,
+    "requestsPerMinute": 20,
+    "publicRequestsPerMinute": 4,
+    "publicRequestsPerDay": 100,
+    "requestTimeoutSec": 300,
+    "maxRequestBytes": 400000,
+    "maxMessages": 200,
+    "maxResponseChars": 200000,
+    "maxTokens": 8192
+  },
+  "streaming": { "batchMs": 250, "maxBatchChars": 4000, "resumeBufferSec": 180 }
+}

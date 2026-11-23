@@ -17,7 +17,8 @@
     "dev:client": "pnpm --filter @relayllm/client dev",
     "worker": "tsx apps/worker/src/cli.ts",
     "test:browser": "pnpm --filter @relayllm/client build && vitest run --config vitest.browser.config.ts",
-    "test:all": "pnpm test && pnpm test:browser"
+    "test:all": "pnpm test && pnpm test:browser",
+    "worker:install": "./scripts/install-worker.sh"
   },
   "devDependencies": {
     "@relayllm/nostr-transport": "workspace:*",

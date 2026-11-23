@@ -1,7 +1,7 @@
 import { writeFileSync, renameSync } from "node:fs";
 import { generateSecretKey } from "nostr-tools/pure";
 import { hexToBytes, bytesToHex } from "@noble/hashes/utils.js";
-import { LocalSigner, NostrEndpoint, RelayPool, normalizeRelayUrl, type RelayStatus } from "@relayllm/nostr-transport";
+import { LocalSigner, NostrEndpoint, RelayPool, ReplayGuard, normalizeRelayUrl, type RelayStatus } from "@relayllm/nostr-transport";
 import { createProvider, type ProviderAdapter, type ProviderHealth } from "@relayllm/provider-adapters";
 import { authorize } from "./access.ts";
 import { configMtime, loadConfig, relayllmHome, saveConfig, statusPath, type Config } from "./config.ts";
@@ -120,6 +120,8 @@ export async function startWorker(opts: StartOptions = {}): Promise<RunningWorke
   const endpoint: NostrEndpoint = new NostrEndpoint({
     pool,
     signer,
+    // The seen-id cache is in memory: refuse anything signed before we started.
+    replay: new ReplayGuard({ notBefore: Math.floor(Date.now() / 1000) }),
     onMessage: (m) => void gateway.handle(m).catch((e) => log.error("handler error", { error: (e as Error).message })),
     onDrop: (d) => log.debug("dropped event", { reason: d.reason }),
     // Only reassemble multi-event messages from senders allowed to send them.

@@ -97,6 +97,22 @@ function showQr(text: string): Promise<void> {
   );
 }
 
+/** Print the pairing link (if a client URL is configured) plus manual details. */
+async function printPairing(cfg: Config, pubkey: string, invite?: string, inviteNote = ""): Promise<void> {
+  out(`Worker npub: ${hexToNpub(pubkey)}`);
+  out(`Relays:      ${cfg.relays.join(", ")}`);
+  if (!cfg.clientUrl) {
+    out("\nNo web client URL configured, so no pairing link can be generated.");
+    out('Set it with: relayllm client-url https://<you>.github.io/<repo>/   (see docs/deploy-github-pages.md)');
+    out("Meanwhile, add the worker in the client manually using the npub and relays above.");
+    if (invite) out(`One-time invite code (enter it in the client's "Add worker" dialog): ${invite}`);
+    return;
+  }
+  const url = buildPairingUrl(cfg.clientUrl, { workerPubkey: pubkey, relays: cfg.relays, name: cfg.name, invite });
+  out(`\nPairing link${inviteNote}:\n${url}\n`);
+  await showQr(url);
+}
+
 function parseDuration(s: string): number {
   const m = /^(\d+)\s*([smhd]?)$/.exec(s.trim());
   if (!m) fail(`invalid duration "${s}" (use e.g. 30m, 24h, 7d)`);
@@ -178,7 +194,7 @@ async function cmdInit(args: string[]): Promise<void> {
     "Which models should remote users be able to use? (numbers, comma-separated, or 'all')": flags.models,
     "Enter model ids to expose (comma-separated), or leave empty": flags.models,
     "Relays (comma-separated)": flags.relays,
-    "Web client URL": flags["client-url"],
+    "Web client URL where you host RelayLLM (leave empty if not deployed yet)": flags["client-url"],
     "Display name for this worker": flags.name,
     "Your own npub, if you already have one (optional)": flags.owner,
     "Store keys in the macOS Keychain (recommended) or a protected file? (keychain/file)": flags["key-storage"],
@@ -306,7 +322,8 @@ async function cmdInit(args: string[]): Promise<void> {
   const relays = relayAns.split(",").map((r) => normalizeRelayUrl(r)).filter((r): r is string => !!r);
   if (!relays.length) fail("at least one valid wss:// relay is required");
   cfg.relays = relays;
-  cfg.clientUrl = await ask("Web client URL", cfg.clientUrl || DEFAULT_CLIENT_URL);
+  const clientUrl = await ask("Web client URL where you host RelayLLM (leave empty if not deployed yet)", cfg.clientUrl || DEFAULT_CLIENT_URL);
+  cfg.clientUrl = /^https?:\/\//.test(clientUrl) ? clientUrl : "";
   cfg.name = await ask("Display name for this worker", cfg.name);
 
   out("\nStep 7/7 — Access");
@@ -322,12 +339,8 @@ async function cmdInit(args: string[]): Promise<void> {
   rl.close();
   saveConfig(cfg, home);
 
-  out(`\nSaved ${configPath(home)}`);
-  out(`\nWorker npub: ${hexToNpub(id.pubkey)}`);
-  const url = buildPairingUrl(cfg.clientUrl, { workerPubkey: id.pubkey, relays: cfg.relays, name: cfg.name, invite: token });
-  out("\nOpen this link on the device you want to chat from (valid 24h, single use):\n");
-  out(url);
-  await showQr(url);
+  out(`\nSaved ${configPath(home)}\n`);
+  await printPairing(cfg, id.pubkey, token, " — open it on the device you want to chat from (valid 24h, single use)");
   out('Next: run "relayllm start" and keep it running.');
 }
 
@@ -395,11 +408,7 @@ async function cmdPair(args: string[]): Promise<void> {
       token = createInvite(c, ttl, values.label);
     }, home);
   }
-  const url = buildPairingUrl(cfg.clientUrl, { workerPubkey: id.pubkey, relays: cfg.relays, name: cfg.name, invite: token });
-  out(`Worker npub: ${hexToNpub(id.pubkey)}`);
-  out(`Relays:      ${cfg.relays.join(", ")}`);
-  out(`\nPairing link${token ? ` (single-use invite, expires in ${values.ttl ?? "24h"})` : ""}:\n${url}\n`);
-  await showQr(url);
+  await printPairing(cfg, id.pubkey, token, token ? ` (single-use invite, expires in ${values.ttl ?? "24h"})` : "");
   if (!token) out('Without an invite, new users appear as pending; approve them with "relayllm users approve <npub>".');
 }
 
@@ -601,7 +610,8 @@ async function cmdIdentity(args: string[]): Promise<void> {
 
 function cmdService(args: string[]): void {
   const kind = args[0] ?? (process.platform === "darwin" ? "launchd" : "systemd");
-  const node = process.execPath;
+  // Prefer a stable launcher path (Homebrew's versioned Cellar path changes on upgrade).
+  const node = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"].find((p) => existsSync(p)) ?? process.execPath;
   const script = process.argv[1]!;
   if (kind === "launchd") {
     const label = "org.relayllm.worker";

@@ -61,6 +61,7 @@ export function AddWorkerDialog({
       .map((r) => normalizeRelayUrl(r))
       .filter((r): r is string => !!r);
     if (!rs.length) return setError("Add at least one relay (wss://…).");
+    if (invite && !/^[A-Za-z0-9_-]{16,128}$/.test(invite)) return setError("That invite code is not valid.");
     onAdd({ id: pubkey, name: name.trim().slice(0, 64) || "My worker", relays: [...new Set(rs)].slice(0, 8), addedAt: Date.now() }, invite);
   };
 
@@ -79,7 +80,14 @@ export function AddWorkerDialog({
           <span>Relays (one per line)</span>
           <textarea rows={3} spellCheck={false} value={relays} onChange={(e) => setRelays(e.target.value)} />
         </label>
-        {invite && <p className="small ok-text">This link includes a one-time invitation; access will be granted automatically.</p>}
+        {initial?.invite ? (
+          <p className="small ok-text">This link includes a one-time invitation; access will be granted automatically.</p>
+        ) : (
+          <label className="field">
+            <span>Invite code (optional)</span>
+            <input spellCheck={false} autoComplete="off" value={invite ?? ""} onChange={(e) => setInvite(e.target.value.trim() || undefined)} placeholder="From relayllm pair --invite" />
+          </label>
+        )}
         <p className="small muted">Run <code>relayllm pair</code> on the worker machine to see its npub, relays and a QR code.</p>
         {error && <p className="error-text">{error}</p>}
         <div className="row end">

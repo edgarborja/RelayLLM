@@ -350,7 +350,8 @@ export class WorkerClient {
       finishReason: done.finishReason,
       errorCode: done.errorCode,
       usage: done.usage,
-      incomplete,
+      // Integrity: the reassembled text must match what the worker generated.
+      incomplete: incomplete || c.asm.content.length !== done.contentLength,
     });
   }
 

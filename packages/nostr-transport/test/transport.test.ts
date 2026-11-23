@@ -121,6 +121,13 @@ describe("ReplayGuard", () => {
     expect(g.check("c", now + 31, now)).toBe("future");
     expect(g.check("d", now - 100, now)).toBe("ok");
   });
+
+  it("rejects events created before notBefore (replay across restarts)", () => {
+    const now = 1_000_000;
+    const g = new ReplayGuard({ notBefore: now - 2 });
+    expect(g.check("old", now - 10, now)).toBe("stale");
+    expect(g.check("new", now - 1, now)).toBe("ok");
+  });
 });
 
 describe("fragmentation", () => {

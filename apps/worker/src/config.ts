@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { z } from "zod";
 
 export const DEFAULT_RELAYS = ["wss://relay.k1.sv", "wss://nos.lol", "wss://relay.damus.io"];
-export const DEFAULT_CLIENT_URL = "https://relayllm.github.io/relayllm/";
+/** No default: pairing links must point at a client deployment you control. */
+export const DEFAULT_CLIENT_URL = "";
 
 const hex64 = z.string().regex(/^[0-9a-f]{64}$/);
 
@@ -27,7 +28,7 @@ export const ConfigSchema = z.object({
     manual: z.array(z.string().min(1).max(256)).default([]),
   }),
   relays: z.array(z.string()).min(1),
-  clientUrl: z.string().default(DEFAULT_CLIENT_URL),
+  clientUrl: z.string().refine((u) => u === "" || /^https?:\/\//.test(u), "must be an http(s) URL").default(DEFAULT_CLIENT_URL),
   access: z.object({
     mode: z.enum(["private", "public"]).default("private"),
     users: z
