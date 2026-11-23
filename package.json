@@ -15,17 +15,20 @@
     "dev:relay": "tsx packages/test-utils/src/dev-relay.ts",
     "dev:mock-provider": "tsx packages/test-utils/src/dev-mock-provider.ts",
     "dev:client": "pnpm --filter @relayllm/client dev",
-    "worker": "tsx apps/worker/src/cli.ts"
+    "worker": "tsx apps/worker/src/cli.ts",
+    "test:browser": "pnpm --filter @relayllm/client build && vitest run --config vitest.browser.config.ts",
+    "test:all": "pnpm test && pnpm test:browser"
   },
   "devDependencies": {
+    "@relayllm/nostr-transport": "workspace:*",
+    "@relayllm/protocol": "workspace:*",
+    "@relayllm/provider-adapters": "workspace:*",
+    "@relayllm/test-utils": "workspace:*",
     "@types/node": "^26.6.6",
     "esbuild": "^0.28.2",
+    "playwright": "^1.65.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.1.1",
-    "@relayllm/test-utils": "workspace:*",
-    "@relayllm/protocol": "workspace:*",
-    "@relayllm/nostr-transport": "workspace:*",
-    "@relayllm/provider-adapters": "workspace:*"
+    "vitest": "^5.1.1"
   }
 }
