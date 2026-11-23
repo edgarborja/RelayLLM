@@ -1,0 +1,14 @@
+{
+  "name": "@relayllm/nostr-transport",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0",
+    "nostr-tools": "^2.26.1",
+    "@relayllm/protocol": "workspace:*"
+  }
+}

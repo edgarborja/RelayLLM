@@ -1,0 +1,29 @@
+{
+  "name": "@relayllm/worker",
+  "version": "0.1.0",
+  "description": "RelayLLM Worker: exposes a local LLM to your devices over encrypted Nostr messages",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "relayllm": "./dist/relayllm.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "@noble/hashes": "^2.4.0",
+    "@relayllm/nostr-transport": "workspace:*",
+    "@relayllm/protocol": "workspace:*",
+    "@relayllm/provider-adapters": "workspace:*",
+    "@relayllm/test-utils": "workspace:*",
+    "nostr-tools": "^2.26.1",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^4.6.7"
+  }
+}

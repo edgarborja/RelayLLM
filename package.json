@@ -1,0 +1,31 @@
+{
+  "name": "relayllm",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@12.23.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit && pnpm --filter @relayllm/client typecheck",
+    "dev:relay": "tsx packages/test-utils/src/dev-relay.ts",
+    "dev:mock-provider": "tsx packages/test-utils/src/dev-mock-provider.ts",
+    "dev:client": "pnpm --filter @relayllm/client dev",
+    "worker": "tsx apps/worker/src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1",
+    "@relayllm/test-utils": "workspace:*",
+    "@relayllm/protocol": "workspace:*",
+    "@relayllm/nostr-transport": "workspace:*",
+    "@relayllm/provider-adapters": "workspace:*"
+  }
+}

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.relayllm-dev/
+*.log
+.DS_Store
+coverage/
+.env
+*.key
