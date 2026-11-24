@@ -137,7 +137,7 @@ describe("system prompts", () => {
   it("ships the starter templates and remembers custom prompts once", () => {
     expect(TEMPLATES.map((t) => t.name)).toEqual([
       "Spanish ⇄ English translator",
-      "Civil War era fiction writer",
+      "American War of Independence fiction writer",
       "Sponsor–child correspondence reviewer",
     ]);
     expect(rememberPrompt([], TEMPLATES[0]!.content)).toBeNull(); // templates aren't copied

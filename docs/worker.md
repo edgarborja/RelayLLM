@@ -26,7 +26,7 @@ The guided setup:
 4. Generates the worker's Nostr identity, or imports an nsec.
 5. Asks for relays. Use 2–3; the defaults are `wss://relay.k1.sv`, `wss://nos.lol` and `wss://relay.damus.io`.
 6. Asks for the URL of your hosted web client (see [deploy-github-pages.md](deploy-github-pages.md)). This may be empty for now.
-7. Prints a pairing link and QR code containing a single-use invite valid for 24 hours. Open it on your phone or laptop, create an identity, and you're in.
+7. Prints a pairing link and QR code containing a single-use invite valid for 7 days. Open it on your phone or laptop, create an identity, and you're in.
 
 Then run it:
 
@@ -49,7 +49,7 @@ No firewall rules, port forwarding or public IP are needed. The worker only make
 |---|---|
 | Status of process, relays and engine | `relayllm status` |
 | Pairing link / QR, without an invite | `relayllm pair` |
-| Pairing link with a one-time invite | `relayllm pair --invite --ttl 2h --label "Anna's phone"` |
+| Pairing link with a one-time invite (valid 7 days; `--ttl 2h` etc. to change) | `relayllm pair --invite --label "Anna's phone"` |
 | Who has access, and pending requests | `relayllm users` |
 | Approve a request | `relayllm users approve npub1…` |
 | Add / remove a user directly | `relayllm users add npub1… --label laptop` / `relayllm users remove npub1…` |

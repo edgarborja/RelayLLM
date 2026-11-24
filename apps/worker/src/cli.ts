@@ -37,6 +37,8 @@ import { KeychainStore, openSecretStore, SECRET_PROVIDER_KEY, SECRET_WORKER_KEY,
 import { buildProvider, loadOrCreateIdentity, startWorker, type WorkerStatus } from "./worker.ts";
 
 const VERSION = "0.1.0";
+/** Default lifetime of single-use invites. */
+const DEFAULT_INVITE_TTL = "7d";
 const home = relayllmHome();
 
 const HELP = `RelayLLM Worker ${VERSION} — use your local LLM from anywhere over encrypted Nostr messages.
@@ -48,7 +50,7 @@ Setup
                                       Non-interactive setup
   relayllm start                      Run the worker (Ctrl+C to stop)
   relayllm status                     Show worker, relay and provider status
-  relayllm pair [--invite] [--ttl 24h] [--label NAME]
+  relayllm pair [--invite] [--ttl 7d] [--label NAME]
                                       Show npub, pairing link and QR code
                                       (--invite adds a single-use access token)
 
@@ -349,12 +351,12 @@ async function cmdInit(args: string[]): Promise<void> {
     if (hex) addUser(cfg, hex, "owner");
     else out("  Not a valid npub; skipped. Use the pairing invite below instead.");
   }
-  const token = createInvite(cfg, 24 * 3600, "first device");
+  const token = createInvite(cfg, parseDuration(DEFAULT_INVITE_TTL), "first device");
   rl.close();
   saveConfig(cfg, home);
 
   out(`\nSaved ${configPath(home)}\n`);
-  await printPairing(cfg, id.pubkey, token, " — open it on the device you want to chat from (valid 24h, single use)");
+  await printPairing(cfg, id.pubkey, token, ` — open it on the device you want to chat from (valid ${DEFAULT_INVITE_TTL.replace("d", " days")}, single use)`);
   out('Next: run "relayllm start" and keep it running.');
 }
 
@@ -445,12 +447,12 @@ async function cmdPair(args: string[]): Promise<void> {
   const id = identityOrFail(cfg);
   let token: string | undefined;
   if (values.invite) {
-    const ttl = parseDuration(values.ttl ?? "24h");
+    const ttl = parseDuration(values.ttl ?? DEFAULT_INVITE_TTL);
     cfg = updateConfig((c) => {
       token = createInvite(c, ttl, values.label);
     }, home);
   }
-  await printPairing(cfg, id.pubkey, token, token ? ` (single-use invite, expires in ${values.ttl ?? "24h"})` : "");
+  await printPairing(cfg, id.pubkey, token, token ? ` (single-use invite, expires in ${values.ttl ?? DEFAULT_INVITE_TTL})` : "");
   if (!token) out('Without an invite, new users appear as pending; approve them with "relayllm users approve <npub>".');
 }
 

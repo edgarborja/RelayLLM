@@ -58,7 +58,7 @@ Relays cannot see prompts, responses, model names, your identity, or the worker'
 * **Worker key:** stored in the macOS Keychain, or in an owner-only `0600` file under `~/.relayllm/secrets` (Linux, or by choice). It is never logged or published. Rotating it (`relayllm identity rotate`) changes the npub, so every device must be paired again; the old key is deleted.
 * **Provider API key:** stored in the same secret store and sent only to the configured loopback endpoint.
 * **Browser identity:** stored as a NIP-49 `ncryptsec` (scrypt with N=2^16, then XChaCha20-Poly1305) under your password. NIP-07 users keep the key in their extension. Private keys never appear in URLs.
-* **Pairing links** contain only the worker npub, relays, display name, and an optional single-use invite. The invite is in the URL fragment, so it isn't sent to the static host. It expires (24 h by default) and only a SHA-256 hash is stored on the worker.
+* **Pairing links** contain only the worker npub, relays, display name, and an optional single-use invite. The invite is in the URL fragment, so it isn't sent to the static host. It expires (7 days by default) and only a SHA-256 hash is stored on the worker.
 
 ## Browser storage threat model
 
