@@ -246,6 +246,11 @@ export class WorkerClient {
     return (await this.#request({ type: "models.list" }, "models.list.result")).models;
   }
 
+  /** Read-only metrics: model metadata, and machine stats if `host` and the owner enabled them. */
+  metrics(opts: { model?: string; host?: boolean } = {}) {
+    return this.#request({ type: "metrics.get", model: opts.model, host: opts.host }, "metrics.result");
+  }
+
   async pair(token?: string, label?: string): Promise<"approved" | "pending" | "denied"> {
     return (await this.#request({ type: "pair.request", token, label }, "pair.result")).status;
   }

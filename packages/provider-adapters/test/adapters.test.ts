@@ -8,6 +8,8 @@ import {
   OpenAICompatibleProvider,
   ProviderError,
   applySystemPromptStyle,
+  parsePrometheus,
+  VLLMProvider,
   type ChatChunk,
 } from "../src/index.ts";
 
@@ -70,7 +72,7 @@ describe("LM Studio adapter (against mock server)", () => {
     const chunks = await collect(p.chat({ model: "mock-llm-small", messages: [{ role: "user", content: "hi" }] }, new AbortController().signal));
     expect(chunks.filter((c) => c.type === "reasoning").map((c) => (c as { text: string }).text).join("")).toBe("hmm");
     expect(chunks.filter((c) => c.type === "content").map((c) => (c as { text: string }).text).join("")).toBe("Echo: hi");
-    expect(chunks.at(-1)).toMatchObject({ type: "done", finishReason: "stop", usage: { completionTokens: 2 } });
+    expect(chunks.at(-1)).toMatchObject({ type: "done", finishReason: "stop", usage: { completionTokens: 3, reasoningTokens: 1 } });
   });
 
   it("reports auth failures as provider errors without leaking the body", async () => {
@@ -242,5 +244,187 @@ describe("system prompt conventions", () => {
       { role: "system", content: "Rule B." },
       { role: "user", content: "hi" },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------- metrics
+
+const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+const never = () => new Response("nope", { status: 404 });
+
+describe("model metrics: LM Studio / Bionic", () => {
+  // Shape captured from Bionic's /api/v1/models.
+  const v1 = {
+    models: [
+      {
+        type: "llm",
+        key: "qwen/qwen3.5-9b",
+        architecture: "qwen3_5",
+        quantization: { name: "4bit", bits_per_weight: 4 },
+        size_bytes: 5977257833,
+        params_string: "9B",
+        loaded_instances: [{ id: "qwen/qwen3.5-9b", engine: "mlx-llm", config: { context_length: 60928, parallel: 4 } }],
+        max_context_length: 262144,
+        variants: ["qwen/qwen3.5-9b@4bit"],
+      },
+      { type: "llm", key: "google/gemma-4-e4b", size_bytes: 6861915950, loaded_instances: [], max_context_length: 131072 },
+    ],
+  };
+
+  it("separates the model maximum from the loaded context window", async () => {
+    const { fn, calls } = fakeFetch({ "/api/v1/models": () => json(v1) });
+    const p = new LMStudioProvider({ baseUrl: "http://localhost:1235/v1", fetchImpl: fn });
+    expect(await p.modelInfo("qwen/qwen3.5-9b")).toEqual({
+      id: "qwen/qwen3.5-9b",
+      state: "loaded",
+      maxContext: 262144,
+      loadedContext: 60928,
+      sizeBytes: 5977257833,
+      architecture: "qwen3_5",
+      quantization: "4bit",
+      parameters: "9B",
+    });
+    const unloaded = await p.modelInfo("google/gemma-4-e4b");
+    expect(unloaded.state).toBe("not-loaded");
+    expect(unloaded.maxContext).toBe(131072);
+    expect(unloaded.loadedContext).toBeUndefined(); // not allocated, so not reported
+    expect(unloaded.memoryBytes).toBeUndefined(); // LM Studio doesn't report memory
+    expect(calls.every((c) => c === "/api/v1/models")).toBe(true);
+  });
+
+  it("falls back to the v0 REST API on older versions", async () => {
+    const { fn } = fakeFetch({
+      "/api/v0/models": () =>
+        json({
+          data: [
+            { id: "a", state: "loaded", max_context_length: 32768, loaded_context_length: 8192, arch: "llama", quantization: "Q4_K_M" },
+            { id: "b", state: "not-loaded", max_context_length: 4096 },
+          ],
+        }),
+    });
+    const p = new LMStudioProvider({ baseUrl: "http://localhost:1234/v1", fetchImpl: fn });
+    expect(await p.modelInfo("a")).toMatchObject({ state: "loaded", maxContext: 32768, loadedContext: 8192, architecture: "llama" });
+    expect(await p.modelInfo("b")).toMatchObject({ state: "not-loaded", maxContext: 4096 });
+    expect((await p.modelInfo("b")).loadedContext).toBeUndefined();
+    expect(await p.modelInfo("missing")).toEqual({ id: "missing", state: "unknown" });
+  });
+});
+
+describe("model metrics: Ollama", () => {
+  const show = {
+    model_info: { "general.architecture": "llama", "llama.context_length": 131072 },
+    details: { family: "llama", parameter_size: "3.2B", quantization_level: "Q4_K_M" },
+    parameters: 'num_ctx                        4096\nstop                           "<|eot_id|>"',
+  };
+
+  it("reads /api/ps for load state, memory and allocated context, /api/show for limits", async () => {
+    let showBody: unknown;
+    const { fn, calls } = fakeFetch({
+      "/api/ps": () => json({ models: [{ name: "llama3.2:3b", model: "llama3.2:3b", size: 4_000_000_000, size_vram: 3_000_000_000, context_length: 8192 }] }),
+      "/api/show": (init) => {
+        showBody = JSON.parse(String(init?.body));
+        expect(init?.method).toBe("POST");
+        return json(show);
+      },
+    });
+    const p = new OllamaProvider({ baseUrl: "http://127.0.0.1:11434/v1", fetchImpl: fn });
+    expect(await p.modelInfo("llama3.2:3b")).toEqual({
+      id: "llama3.2:3b",
+      state: "loaded",
+      maxContext: 131072,
+      loadedContext: 8192,
+      memoryBytes: 4_000_000_000,
+      vramBytes: 3_000_000_000,
+      architecture: "llama",
+      quantization: "Q4_K_M",
+      parameters: "3.2B",
+    });
+    expect(showBody).toEqual({ model: "llama3.2:3b" });
+    expect(new Set(calls)).toEqual(new Set(["/api/ps", "/api/show"]));
+  });
+
+  it("uses the model's num_ctx when not loaded, and reports what it can when one endpoint fails", async () => {
+    const p = new OllamaProvider({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      fetchImpl: fakeFetch({ "/api/ps": () => json({ models: [] }), "/api/show": () => json(show) }).fn,
+    });
+    const info = await p.modelInfo("llama3.2:3b");
+    expect(info).toMatchObject({ state: "not-loaded", maxContext: 131072, loadedContext: 4096 });
+    expect(info.memoryBytes).toBeUndefined();
+
+    const noShow = new OllamaProvider({
+      baseUrl: "http://127.0.0.1:11434/v1",
+      fetchImpl: fakeFetch({ "/api/ps": () => json({ models: [] }), "/api/show": never }).fn,
+    });
+    expect(await noShow.modelInfo("x")).toEqual({ id: "x", state: "not-loaded" });
+
+    const down = new OllamaProvider({ baseUrl: "http://127.0.0.1:11434/v1", fetchImpl: fakeFetch({}).fn });
+    await expect(down.modelInfo("x")).rejects.toBeInstanceOf(ProviderError);
+  });
+});
+
+describe("model metrics: vLLM", () => {
+  const prom = [
+    "# HELP vllm:num_requests_running Number of requests running.",
+    "# TYPE vllm:num_requests_running gauge",
+    'vllm:num_requests_running{engine="0",model_name="meta/llama"} 2.0',
+    'vllm:num_requests_waiting{engine="0",model_name="meta/llama"} 1.0',
+    'vllm:kv_cache_usage_perc{engine="0",model_name="meta/llama"} 0.375',
+    'vllm:secret_internal_path{path="/home/x"} 1',
+    "process_resident_memory_bytes 123456",
+  ].join("\n");
+
+  it("reports max_model_len as the configured window and reads Prometheus only when enabled", async () => {
+    const routes = { "/v1/models": () => json({ data: [{ id: "meta/llama", max_model_len: 16384 }] }), "/metrics": () => new Response(prom) };
+    const off = fakeFetch(routes);
+    const p = new VLLMProvider({ baseUrl: "http://localhost:8000/v1", fetchImpl: off.fn });
+    expect(await p.modelInfo("meta/llama")).toEqual({ id: "meta/llama", state: "loaded", loadedContext: 16384 });
+    expect((await p.modelInfo("meta/llama")).maxContext).toBeUndefined(); // vLLM doesn't expose the model's own maximum
+    expect(await p.engineStats()).toBeNull();
+    expect(off.calls).not.toContain("/metrics");
+
+    const on = fakeFetch(routes);
+    const q = new VLLMProvider({ baseUrl: "http://localhost:8000/v1", fetchImpl: on.fn, engineMetrics: true });
+    expect(await q.engineStats()).toEqual({ kvCacheUsage: 0.375, requestsRunning: 2, requestsWaiting: 1 });
+  });
+
+  it("parses only allowlisted Prometheus samples", () => {
+    const m = parsePrometheus(prom + '\nvllm:num_requests_running{engine="1"} 3', ["vllm:num_requests_running", "vllm:gpu_cache_usage_perc"]);
+    expect([...m.entries()]).toEqual([["vllm:num_requests_running", 5]]);
+  });
+});
+
+describe("model metrics: generic OpenAI-compatible", () => {
+  it("exposes only what /v1/models carries, never invented values", async () => {
+    const { fn, calls } = fakeFetch({
+      "/v1/models": () => json({ data: [{ id: "plain", object: "model" }, { id: "llamacpp", meta: { n_ctx_train: 32768, n_params: 8_030_000_000, size: 4_920_000_000 } }] }),
+    });
+    const p = createProvider("openai-compatible", { baseUrl: "http://localhost:8080/v1", fetchImpl: fn });
+    expect(await p.modelInfo("plain")).toEqual({
+      id: "plain",
+      state: "unknown",
+      maxContext: undefined,
+      loadedContext: undefined,
+      sizeBytes: undefined,
+      parameters: undefined,
+    });
+    expect(await p.modelInfo("llamacpp")).toMatchObject({ maxContext: 32768, sizeBytes: 4_920_000_000, parameters: "8.0B" });
+    expect(await p.engineStats()).toBeNull();
+    expect(p.metricsSupport).toEqual({ loadState: false, maxContext: false, loadedContext: false, memory: false, engineStats: false });
+    expect(new Set(calls)).toEqual(new Set(["/v1/models"]));
+  });
+
+  it("reports reasoning tokens from usage details", async () => {
+    const { fn } = fakeFetch({
+      "/v1/chat/completions": () =>
+        sse([
+          { choices: [{ delta: { content: "ok" } }] },
+          { choices: [], usage: { prompt_tokens: 12, completion_tokens: 299, completion_tokens_details: { reasoning_tokens: 297 } } },
+          "[DONE]",
+        ]),
+    });
+    const p = createProvider("openai-compatible", { baseUrl: "http://localhost:8080/v1", fetchImpl: fn });
+    const chunks = await collect(p.chat({ model: "m", messages: [{ role: "user", content: "hi" }] }, new AbortController().signal));
+    expect(chunks.at(-1)).toEqual({ type: "done", finishReason: "stop", usage: { promptTokens: 12, completionTokens: 299, reasoningTokens: 297 } });
   });
 });

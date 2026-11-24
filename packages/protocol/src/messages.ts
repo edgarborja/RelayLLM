@@ -101,6 +101,20 @@ export const PairReq = z
   })
   .strict();
 
+/**
+ * Read-only metrics for the context indicator. `model` must be a model exposed
+ * to the caller. `host` asks for machine memory stats; the worker includes
+ * them only if its owner enabled host monitoring.
+ */
+export const MetricsReq = z
+  .object({
+    ...clientBase,
+    type: z.literal("metrics.get"),
+    model: z.string().min(1).max(256).optional(),
+    host: z.boolean().optional(),
+  })
+  .strict();
+
 export const ClientMessage = z.discriminatedUnion("type", [
   ServerInfoReq,
   ModelsListReq,
@@ -108,6 +122,7 @@ export const ClientMessage = z.discriminatedUnion("type", [
   ChatCancelReq,
   ChatResumeReq,
   PairReq,
+  MetricsReq,
 ]);
 export type ClientMessage = z.infer<typeof ClientMessage>;
 
@@ -170,6 +185,9 @@ export const ChatDelta = z
   })
   .strict();
 
+export const TokenSource = z.enum(["measured", "estimated"]);
+export type TokenSource = z.infer<typeof TokenSource>;
+
 export const FinishReason = z.enum(["stop", "length", "cancelled", "error", "timeout"]);
 
 export const ChatComplete = z
@@ -188,6 +206,15 @@ export const ChatComplete = z
       .object({
         promptTokens: z.number().int().optional(),
         completionTokens: z.number().int().optional(),
+        /** Part of completionTokens spent on reasoning, when reported. */
+        reasoningTokens: z.number().int().optional(),
+        /** "measured": counted by the engine; "estimated": from text length. */
+        source: TokenSource.optional(),
+        /** Output tokens per second, from first token to end of generation. */
+        tokensPerSecond: z.number().nonnegative().optional(),
+        /** Time from request to first generated token. */
+        firstTokenMs: z.number().int().nonnegative().optional(),
+        generationMs: z.number().int().nonnegative().optional(),
       })
       .optional(),
   })
@@ -224,6 +251,88 @@ export const ServerError = z
   })
   .strict();
 
+// ---------------------------------------------------------------- metrics
+//
+// Every value is nullable: null means "unavailable" (the engine or platform
+// doesn't report it), never zero. Timestamps are Unix milliseconds of when
+// the value was read.
+
+const bytes = z.number().nonnegative().nullable();
+const count = z.number().int().nonnegative().nullable();
+const label = z.string().max(64).nullable();
+
+export const ModelMetrics = z
+  .object({
+    id: z.string().max(256),
+    at: z.number().int(),
+    state: z.enum(["loaded", "not-loaded", "unknown"]),
+    /** The model's theoretical maximum context (what it was trained for). */
+    maxContext: count,
+    /** The context window currently configured or allocated by the engine. */
+    loadedContext: count,
+    /** Memory used by the loaded model, as reported by the engine. */
+    memoryBytes: bytes,
+    /** Part of memoryBytes in GPU memory, when reported separately. */
+    vramBytes: bytes,
+    /** Size of the model weights on disk. */
+    sizeBytes: bytes,
+    architecture: label,
+    quantization: label,
+    parameters: label,
+  })
+  .strict();
+export type ModelMetrics = z.infer<typeof ModelMetrics>;
+
+export const EngineMetrics = z
+  .object({
+    at: z.number().int(),
+    /** Fraction (0–1) of the engine's KV cache in use. */
+    kvCacheUsage: z.number().min(0).max(1).nullable(),
+    requestsRunning: count,
+    requestsWaiting: count,
+  })
+  .strict();
+export type EngineMetrics = z.infer<typeof EngineMetrics>;
+
+export const HostMetrics = z
+  .object({
+    at: z.number().int(),
+    platform: z.enum(["macos", "linux", "windows", "other"]),
+    memTotalBytes: bytes,
+    memAvailableBytes: bytes,
+    memUsedPercent: z.number().min(0).max(100).nullable(),
+    swapTotalBytes: bytes,
+    swapUsedBytes: bytes,
+    /** OS memory pressure level (macOS natively; Linux from PSI). */
+    pressure: z.enum(["normal", "warning", "critical"]).nullable(),
+  })
+  .strict();
+export type HostMetrics = z.infer<typeof HostMetrics>;
+
+export const MetricsRes = z
+  .object({
+    ...base,
+    type: z.literal("metrics.result"),
+    re: MessageId,
+    at: z.number().int(),
+    provider: z.enum(["lmstudio", "ollama", "vllm", "openai-compatible"]),
+    /** Null if no model was requested or the engine couldn't be reached. */
+    model: ModelMetrics.nullable(),
+    /** Engine-wide stats (vLLM Prometheus), only if the owner enabled them. */
+    engine: EngineMetrics.nullable(),
+    /** Machine stats, only if requested and the owner enabled host monitoring. */
+    host: HostMetrics.nullable(),
+    monitoring: z
+      .object({
+        host: z.boolean(),
+        /** How often clients should refresh while the panel is open. */
+        refreshSec: z.number().int().min(1),
+      })
+      .strict(),
+  })
+  .strict();
+export type MetricsResult = z.infer<typeof MetricsRes>;
+
 export const PairRes = z
   .object({
     ...base,
@@ -241,6 +350,7 @@ export const WorkerMessage = z.discriminatedUnion("type", [
   ChatComplete,
   ServerError,
   PairRes,
+  MetricsRes,
 ]);
 export type WorkerMessage = z.infer<typeof WorkerMessage>;
 

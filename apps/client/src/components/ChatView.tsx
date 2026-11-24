@@ -30,6 +30,8 @@ export interface ChatViewProps {
   onEditPrompt: () => void;
   /** Advanced settings for a new conversation (the system prompt editor). */
   newChatAdvanced: ReactNode;
+  /** Context usage indicator, shown next to the model selector. */
+  contextIndicator?: ReactNode;
 }
 
 function StatusDot({ conn }: { conn: ConnectionState | null }) {
@@ -285,6 +287,7 @@ export function ChatView(p: ChatViewProps) {
         {p.worker && approved && (
           <Selector value={p.model} placeholder="Choose model" items={models.map((m) => ({ id: m.id, label: modelLabel(m) }))} onChange={p.onSelectModel} />
         )}
+        {p.worker && approved && p.contextIndicator}
         <div className="spacer" />
         {p.conversation && messages.length > 0 && (
           <button

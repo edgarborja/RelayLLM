@@ -5,6 +5,7 @@ import * as nip19 from "nostr-tools/nip19";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { buildContext } from "../src/lib/context.ts";
 import { LocalDB, type Conversation } from "../src/lib/db.ts";
+import { estimateContext, estimateTokens } from "../src/lib/metrics.ts";
 import { describePrompt, rememberPrompt, TEMPLATES } from "../src/lib/prompts.ts";
 import { createLocalIdentity, loadStoredIdentity, revealNsec, unlockLocal, WrongPasswordError } from "../src/lib/identity.ts";
 
@@ -224,5 +225,38 @@ describe("system prompts", () => {
     raw.close();
     const text = JSON.stringify(dump, (_k, v) => (v instanceof ArrayBuffer ? Buffer.from(v).toString("latin1") : v));
     for (const secret of ["pirate", "translator", "confidential"]) expect(text).not.toContain(secret);
+  });
+});
+
+describe("context accounting", () => {
+  type Rec = import("../src/lib/db.ts").ChatMessageRecord;
+  const user = (content: string, i: number): Rec => ({ id: `u${i}`, role: "user", content, createdAt: i });
+  const reply = (content: string, i: number, usage?: Rec["usage"]): Rec => ({ id: `a${i}`, role: "assistant", content, createdAt: i, status: "done", usage });
+
+  it("uses the engine's measured count for the last request, excluding reasoning that isn't sent back", () => {
+    const msgs = [user("hello there", 1), reply("Hi! How can I help?", 2, { promptTokens: 120, completionTokens: 340, reasoningTokens: 330, source: "measured" })];
+    const e = estimateContext(msgs, "Be brief.", undefined);
+    expect(e).toMatchObject({ tokens: 120 + 10, basis: "measured" });
+    expect(e.last?.reasoningTokens).toBe(330);
+  });
+
+  it("adds estimates for messages newer than the last measured reply", () => {
+    const msgs = [
+      user("q1", 1),
+      reply("a1", 2, { promptTokens: 50, completionTokens: 20, source: "measured" }),
+      user("x".repeat(400), 3),
+      { ...reply("", 4), status: "error" as const, error: "failed" },
+    ];
+    expect(estimateContext(msgs, undefined, undefined)).toMatchObject({ tokens: 50 + 20 + 4 + estimateTokens("x".repeat(400)), basis: "mixed" });
+  });
+
+  it("falls back to a text-length estimate when the engine reported nothing, and says so", () => {
+    const msgs = [user("x".repeat(40), 1), reply("y".repeat(80), 2, { promptTokens: 14, completionTokens: 20, source: "estimated" })];
+    const e = estimateContext(msgs, "z".repeat(20), undefined);
+    expect(e.basis).toBe("estimated");
+    expect(e.tokens).toBe(3 * 4 + 5 + 10 + 20);
+    expect(estimateContext([], undefined, undefined)).toEqual({ tokens: 0, basis: "none" });
+    // A new chat with only a system prompt still counts it.
+    expect(estimateContext([], "z".repeat(40), undefined)).toMatchObject({ tokens: 4 + 10, basis: "estimated" });
   });
 });

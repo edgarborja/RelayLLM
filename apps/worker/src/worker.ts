@@ -1,3 +1,4 @@
+import type { HostSampler } from "./host-metrics.ts";
 import { writeFileSync, renameSync } from "node:fs";
 import { generateSecretKey } from "nostr-tools/pure";
 import { hexToBytes, bytesToHex } from "@noble/hashes/utils.js";
@@ -26,6 +27,7 @@ export function buildProvider(cfg: Config, store: SecretStore | null): ProviderA
     allowRemoteEndpoint: cfg.provider.allowRemoteEndpoint,
     streaming: cfg.provider.streaming,
     systemPromptStyle: cfg.provider.systemPromptStyle,
+    engineMetrics: cfg.monitoring.engineMetrics,
   });
 }
 
@@ -57,6 +59,8 @@ export interface StartOptions {
   config?: Config;
   writeStatus?: boolean;
   pingIntervalMs?: number;
+  /** Machine stats source (tests). */
+  hostSampler?: HostSampler;
 }
 
 export async function startWorker(opts: StartOptions = {}): Promise<RunningWorker> {
@@ -115,6 +119,7 @@ export async function startWorker(opts: StartOptions = {}): Promise<RunningWorke
     },
     provider,
     log,
+    hostSampler: opts.hostSampler,
     send: (to, message) => endpoint.send(to, message),
   });
 

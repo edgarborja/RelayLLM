@@ -28,6 +28,7 @@ taken from a message field.
 | `chat.cancel` | `target` (chat id) | (the stream ends with `finishReason: "cancelled"`) |
 | `chat.resume` | `target`, `missing?[seq]` or `fromSeq?` | re-sent `chat.delta`s and `chat.complete` if finished |
 | `pair.request` | `token?` (invite), `label?` | `pair.result {status: approved\|pending\|denied}` |
+| `metrics.get` | `model?` (an exposed model), `host?` (bool) | `metrics.result` |
 
 ### System prompts
 
@@ -55,7 +56,8 @@ All carry `re`, the id of the request they answer.
 | `models.list.result` | `models[{id, contextLength?, streaming, cancel}]` (only models exposed to this user) |
 | `chat.ack` | `model` |
 | `chat.delta` | `seq` (0-based), `content?`, `reasoning?` |
-| `chat.complete` | `deltaCount`, `finishReason` (stop\|length\|cancelled\|error\|timeout), `errorCode?`, `contentLength`, `usage?{promptTokens, completionTokens}` |
+| `chat.complete` | `deltaCount`, `finishReason` (stop\|length\|cancelled\|error\|timeout), `errorCode?`, `contentLength`, `usage?{promptTokens, completionTokens, reasoningTokens?, source?, tokensPerSecond?, firstTokenMs?, generationMs?}` |
+| `metrics.result` | `at`, `provider`, `model` (ModelMetrics\|null), `engine` (EngineMetrics\|null), `host` (HostMetrics\|null), `monitoring{host, refreshSec}` |
 | `server.error` | `code`, `message` (fixed, sanitized text), `retryAfter?`, `versions?` |
 | `pair.result` | `status` |
 
@@ -64,6 +66,35 @@ Error codes: `unauthorized`, `pending_approval`, `rate_limited`, `busy`,
 `provider_unavailable`, `provider_error`, `timeout`, `too_large`, `not_found`,
 `expired`, `internal`. Messages are fixed strings. Provider bodies, file paths
 and stack traces are never forwarded.
+
+## Metrics
+
+`metrics.get` is read-only and answered only to explicitly authorized users.
+Unknown users, and anonymous users in public mode, get `unauthorized`. It has
+its own rate budget (30/min), separate from chat. In every metrics object,
+**`null` means unavailable**, never zero. `at` fields are Unix milliseconds of
+when the value was read.
+
+| Object | Fields |
+|---|---|
+| `ModelMetrics` | `id`, `at`, `state` (loaded\|not-loaded\|unknown), `maxContext` (the model's theoretical maximum), `loadedContext` (the window the engine actually allocated or configured), `memoryBytes`, `vramBytes`, `sizeBytes` (weights on disk), `architecture`, `quantization`, `parameters` |
+| `EngineMetrics` | `at`, `kvCacheUsage` (0–1), `requestsRunning`, `requestsWaiting`. Only when the owner enables engine metrics (vLLM). |
+| `HostMetrics` | `at`, `platform`, `memTotalBytes`, `memAvailableBytes`, `memUsedPercent`, `swapTotalBytes`, `swapUsedBytes`, `pressure` (normal\|warning\|critical). Only when requested **and** the owner enabled host monitoring. |
+
+Token accounting: `chat.complete.usage.source` is `measured` when the engine
+counted the tokens and `estimated` when the worker derived them from text length
+(~4 characters per token). The worker times generation itself:
+`firstTokenMs` runs from the engine request to the first token, and
+`tokensPerSecond = completionTokens / generationMs`.
+
+The client estimates the next request's context as the last measured
+`promptTokens`, plus visible output (`completionTokens − reasoningTokens`),
+plus text length for anything newer. It divides by `loadedContext`, never by
+`maxContext`.
+
+Clients poll `metrics.get` every `monitoring.refreshSec` seconds only while
+their metrics panel is open. The worker never samples in the background, and it
+reuses a host sample for half the interval.
 
 ## Fragments (transport level)
 

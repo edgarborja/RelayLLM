@@ -73,6 +73,9 @@ Configuration
   relayllm provider set [--kind K] [--url URL] [--api-key] [--no-api-key] [--allow-remote]
                        [--system-style system|developer|user-prefix]
   relayllm client-url <url>           Set the web client URL used in pairing links
+  relayllm monitoring [on|off] [--interval SEC] [--engine-metrics on|off]
+                                      Share machine memory stats with authorized users
+                                      (off by default); vLLM Prometheus stats
   relayllm identity                   Show the worker npub
   relayllm identity rotate            Generate a new worker identity (re-pair all devices)
   relayllm identity import            Import an existing nsec (read from hidden prompt)
@@ -374,6 +377,33 @@ async function cmdStart(): Promise<void> {
   process.on("SIGTERM", () => void stop());
 }
 
+function cmdMonitoring(args: string[]): void {
+  const { values, positionals } = parseArgs({
+    args,
+    options: { interval: { type: "string" }, "engine-metrics": { type: "string" } },
+    allowPositionals: true,
+  });
+  const [mode] = positionals;
+  if (mode && mode !== "on" && mode !== "off") fail("usage: relayllm monitoring [on|off] [--interval SEC] [--engine-metrics on|off]");
+  const interval = values.interval === undefined ? undefined : Number(values.interval);
+  if (interval !== undefined && (!Number.isInteger(interval) || interval < 2 || interval > 300)) fail("--interval must be 2–300 seconds");
+  const engine = values["engine-metrics"];
+  if (engine !== undefined && engine !== "on" && engine !== "off") fail("--engine-metrics must be on or off");
+  const cfg =
+    mode || interval !== undefined || engine !== undefined
+      ? updateConfig((c) => {
+          if (mode) c.monitoring.host = mode === "on";
+          if (interval !== undefined) c.monitoring.intervalSec = interval;
+          if (engine) c.monitoring.engineMetrics = engine === "on";
+        }, home)
+      : loadConfig(home);
+  out(`Machine monitoring: ${cfg.monitoring.host ? "on" : "off"}${cfg.monitoring.host ? " (RAM, swap and memory pressure; shared with authorized users only)" : ""}`);
+  out(`Refresh interval:   ${cfg.monitoring.intervalSec}s, only while a client has its metrics panel open`);
+  out(`Engine metrics:     ${cfg.monitoring.engineMetrics ? "on" : "off"}${cfg.provider.kind === "vllm" ? "" : " (vLLM only)"}`);
+  if (mode || interval !== undefined) out("A running worker picks this up within a few seconds.");
+  if (engine) out("Restart the worker for the engine-metrics change to take effect.");
+}
+
 async function cmdStatus(): Promise<void> {
   const cfg = loadConfig(home);
   const id = identityOrFail(cfg);
@@ -381,6 +411,7 @@ async function cmdStatus(): Promise<void> {
   out(`npub:     ${hexToNpub(id.pubkey)}`);
   out(`Access:   ${cfg.access.mode} — ${cfg.access.users.length} user(s), ${cfg.access.pending.length} pending`);
   out(`Models:   ${cfg.models.exposed.join(", ") || "(none exposed)"}`);
+  out(`Monitor:  machine stats ${cfg.monitoring.host ? "shared with authorized users" : "off"}`);
   const p = buildProvider(cfg, store(cfg));
   const h = await p.health();
   out(`Provider: ${cfg.provider.kind} ${cfg.provider.baseUrl} — ${h.ok ? `reachable (${h.latencyMs}ms)` : `UNREACHABLE (${h.detail})`}`);
@@ -723,6 +754,8 @@ async function main(): Promise<void> {
       return cmdRelays(args);
     case "provider":
       return cmdProvider(args);
+    case "monitoring":
+      return cmdMonitoring(args);
     case "client-url": {
       const u = args[0];
       if (!u || !/^https?:\/\//.test(u)) fail("usage: relayllm client-url https://you.github.io/relayllm/");

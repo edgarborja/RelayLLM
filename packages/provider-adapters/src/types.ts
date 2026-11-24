@@ -1,3 +1,4 @@
+import type { EngineStats, MetricsSupport, ModelRuntimeInfo } from "./metrics.ts";
 import type { SystemPromptStyle } from "./system-prompt.ts";
 
 /**
@@ -38,7 +39,7 @@ export type ChatChunk =
   | {
       type: "done";
       finishReason: "stop" | "length" | "error";
-      usage?: { promptTokens?: number; completionTokens?: number };
+      usage?: { promptTokens?: number; completionTokens?: number; reasoningTokens?: number };
     };
 
 export interface ProviderHealth {
@@ -62,6 +63,11 @@ export interface ProviderAdapter {
   listModels(): Promise<ProviderModel[]>;
   /** Stream a chat completion. Abort `signal` to cancel. */
   chat(req: ChatRequest, signal: AbortSignal): AsyncIterable<ChatChunk>;
+  readonly metricsSupport: MetricsSupport;
+  /** Read-only metadata and load state for one model (fixed engine endpoints only). */
+  modelInfo(id: string): Promise<ModelRuntimeInfo>;
+  /** Engine-wide stats, or null when the engine has none. */
+  engineStats(): Promise<EngineStats | null>;
 }
 
 export class ProviderError extends Error {

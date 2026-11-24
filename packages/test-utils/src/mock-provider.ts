@@ -19,6 +19,8 @@ export interface MockProviderOptions {
   /** Never respond to chat requests (timeout testing). */
   hang?: boolean;
   apiKey?: string;
+  /** Set false to omit token usage from responses (like some engines). */
+  usage?: boolean;
 }
 
 export interface ChatLogEntry {
@@ -80,6 +82,25 @@ export class MockProvider {
       );
       return;
     }
+    if (req.method === "GET" && path === "/api/v1/models") {
+      // LM Studio 0.4+/Bionic native listing: loaded instances carry the configured context.
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          models: this.models.map((m, i) => ({
+            type: m.type ?? "llm",
+            key: m.id,
+            architecture: "mockarch",
+            quantization: { name: "Q4_K_M", bits_per_weight: 4 },
+            size_bytes: 1_500_000_000,
+            params_string: "1B",
+            max_context_length: 32768,
+            loaded_instances: i === 0 ? [{ id: m.id, config: { context_length: 4096 } }] : [],
+          })),
+        }),
+      );
+      return;
+    }
     if (req.method === "POST" && path === "/v1/chat/completions") {
       const chunks: Buffer[] = [];
       for await (const c of req) chunks.push(c as Buffer);
@@ -105,7 +126,7 @@ export class MockProvider {
         res.end(
           JSON.stringify({
             choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-            usage: { prompt_tokens: 5, completion_tokens: tokens.length },
+            ...(this.opts.usage === false ? {} : { usage: { prompt_tokens: 5, completion_tokens: tokens.length } }),
           }),
         );
         entry.finished = true;
@@ -128,7 +149,19 @@ export class MockProvider {
         if (delay) await new Promise((r) => setTimeout(r, delay));
       }
       send({ id: "x", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-      send({ id: "x", object: "chat.completion.chunk", choices: [], usage: { prompt_tokens: 5, completion_tokens: tokens.length } });
+      if (this.opts.usage !== false) {
+        const promptTokens = messages.reduce((n, m) => n + Math.ceil(m.content.length / 4) + 4, 0);
+        send({
+          id: "x",
+          object: "chat.completion.chunk",
+          choices: [],
+          usage: {
+            prompt_tokens: promptTokens,
+            completion_tokens: pieces.length,
+            completion_tokens_details: { reasoning_tokens: pieces.filter((p) => p.reasoning).length },
+          },
+        });
+      }
       res.write("data: [DONE]\n\n");
       entry.finished = true;
       res.end();

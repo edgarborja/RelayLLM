@@ -32,6 +32,7 @@ let config: Config;
 let server: Server;
 let baseUrl: string;
 let browser: Browser;
+let hostSamples = 0;
 
 function serveStatic(): Promise<Server> {
   const types: Record<string, string> = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml" };
@@ -64,7 +65,26 @@ beforeAll(async () => {
   config.provider = { kind: "lmstudio", baseUrl: provider.baseUrl, allowRemoteEndpoint: false, streaming: true, hasApiKey: false, systemPromptStyle: "system" };
   config.models.exposed = ["mock-llm-small", "mock-llm-large"];
   config.streaming.batchMs = 100;
-  worker = await startWorker({ config, store, provider: buildProvider(config, store), log: silentLogger, writeStatus: false });
+  worker = await startWorker({
+    config,
+    store,
+    provider: buildProvider(config, store),
+    log: silentLogger,
+    writeStatus: false,
+    hostSampler: async () => {
+      hostSamples++;
+      return {
+        at: Date.now(),
+        platform: "macos",
+        memTotalBytes: 16 * 1024 ** 3,
+        memAvailableBytes: 4 * 1024 ** 3,
+        memUsedPercent: 75,
+        swapTotalBytes: 1024 ** 3,
+        swapUsedBytes: 512 * 1024 ** 2,
+        pressure: "warning",
+      };
+    },
+  });
   server = await serveStatic();
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
   browser = await chromium.launch();
@@ -257,5 +277,58 @@ describe("static web client", () => {
     await page.locator(".conv-title", { hasText: "ahoy" }).click();
     await expect(chip.textContent()).resolves.toContain("You are a pirate captain.");
     expect(await page.evaluate(() => localStorage.getItem("relayllm.prefs.v1") ?? "")).not.toContain("pirate");
+  }, 60_000);
+
+  it("shows context usage next to the model and a details panel that polls machine stats only while open", async () => {
+    const ctx = await browser.newContext();
+    const p4 = await ctx.newPage();
+    const invite = createInvite(config, 600, "metrics");
+    await p4.goto(buildPairingUrl(baseUrl, { workerPubkey: worker.pubkey, relays: [relay.url], name: "Test Box", invite }));
+    await createIdentity(p4);
+    await p4.getByRole("dialog").getByRole("button", { name: "Add worker" }).click();
+    await p4.getByPlaceholder("Message…").waitFor({ timeout: 15_000 });
+
+    const indicator = p4.getByRole("button", { name: "Context usage" });
+    await indicator.waitFor();
+    await expect.poll(() => indicator.textContent()).toBe("0%"); // loaded window known (4,096), nothing sent yet
+
+    // A 2,000-character message; the mock replies with 600 words (long enough to time the speed).
+    await sendAndWait(p4, `long ${"x".repeat(1995)}`);
+    // 504 prompt tokens + 600 visible output tokens (3 reasoning tokens aren't sent back) of 4,096.
+    await expect.poll(() => indicator.textContent()).toBe("27%");
+
+    await indicator.click();
+    const panel = p4.getByRole("dialog", { name: "Context and model details" });
+    await panel.getByText("Loaded context").waitFor();
+    const text = async () => (await panel.textContent()) ?? "";
+    await expect.poll(text).toContain("~1,104 of 4,096 tokens (27%)");
+    const t = await text();
+    expect(t).toContain("Loaded context4,096 tokens");
+    expect(t).toContain("Model maximum32,768 tokens (not all allocated)");
+    expect(t).toContain("Memory in useUnavailable"); // LM Studio doesn't report it: not shown as zero
+    expect(t).toContain("504 in · 603 out (3 reasoning) · measured");
+    expect(t).toMatch(/Speed[\d.]+ tokens\/s · first token/);
+    expect(t).toContain("Machine monitoring is off");
+    expect(hostSamples).toBe(0);
+
+    // Owner enables monitoring (relayllm monitoring on --interval 2); reopen the panel.
+    config.monitoring.host = true;
+    config.monitoring.intervalSec = 2;
+    await indicator.click(); // close
+    await indicator.click(); // open
+    await expect.poll(text, { timeout: 10_000 }).toContain("Memory used12.0 GB of 16.0 GB (75%)");
+    expect(await text()).toContain("Swap512 MB of 1.0 GB");
+    expect(await text()).toContain("Memory pressureWarning");
+    await expect.poll(() => hostSamples, { timeout: 10_000 }).toBeGreaterThanOrEqual(3); // refreshed every 2 s while open
+
+    await p4.keyboard.press("Escape");
+    await expect(panel.count()).resolves.toBe(0);
+    await p4.waitForTimeout(500);
+    const after = hostSamples;
+    await p4.waitForTimeout(4500);
+    expect(hostSamples).toBe(after); // polling stopped when the panel closed
+
+    config.monitoring.host = false;
+    await ctx.close();
   }, 60_000);
 });

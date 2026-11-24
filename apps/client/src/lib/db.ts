@@ -1,4 +1,5 @@
 import { openDB, deleteDB, type IDBPDatabase } from "idb";
+import type { UsageRecord } from "./metrics.ts";
 import type { SavedPrompt } from "./prompts.ts";
 
 /**
@@ -34,6 +35,8 @@ export interface ChatMessageRecord {
   truncated?: boolean;
   /** Earlier messages left out of the context for this reply. */
   omitted?: number;
+  /** Token counts and speed reported by the worker for this reply. */
+  usage?: UsageRecord;
 }
 
 export interface Conversation {

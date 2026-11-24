@@ -61,6 +61,8 @@ No firewall rules, port forwarding or public IP are needed. The worker only make
 | Engine API key | `relayllm provider set --api-key` (hidden prompt) |
 | How system prompts reach the engine | `relayllm provider set --system-style system\|developer\|user-prefix` |
 | …for one model only | `relayllm models system-style <id> user-prefix` (`default` to reset) |
+| Share machine memory stats with authorized users | `relayllm monitoring on` (`off` to stop; `--interval 10`) |
+| vLLM KV-cache / queue stats | `relayllm monitoring --engine-metrics on` (restart needed) |
 | Web client URL for links | `relayllm client-url https://you.github.io/relayllm/` |
 | Show worker npub | `relayllm identity` |
 | New worker identity | `relayllm identity rotate` |
@@ -88,6 +90,7 @@ User, model and access changes apply to a running worker within about 2 seconds.
   "maxTokens": 8192,             // cap (and default) for max_tokens
   "maxSystemPromptChars": 32000  // total length of a conversation's system prompt
 },
+"monitoring": { "host": false, "intervalSec": 10, "engineMetrics": false },
 "streaming": { "batchMs": 250, "maxBatchChars": 4000, "resumeBufferSec": 180 }
 ```
 
@@ -104,6 +107,42 @@ Engines differ in how they accept system instructions, so you choose the convent
 | `user-prefix` | text prepended to the first user message | chat templates that reject the system role (some Gemma/Mistral builds return HTTP 400) |
 
 Set it for the whole engine with `relayllm provider set --system-style …` (restart needed), or per model with `relayllm models system-style <id> …` (applies within a few seconds).
+
+## Context and resource monitoring
+
+The web client shows a small context indicator next to the model selector.
+Clicking it opens a panel with:
+
+* this conversation's context use, against the model's **loaded** context window;
+* the model's maximum context, load state, size and memory;
+* the latest generation speed;
+* optionally, this machine's memory.
+
+What each engine reports (anything missing is shown as "Unavailable"):
+
+| | Load state | Max context | Loaded context | Model memory | Token usage |
+|---|---|---|---|---|---|
+| LM Studio / Bionic | ✓ (`/api/v1/models`, fallback `/api/v0/models`) | ✓ | ✓ | – (size on disk) | ✓ incl. reasoning |
+| Ollama | ✓ (`/api/ps`) | ✓ (`/api/show`) | ✓ (`/api/ps`, or the model's `num_ctx`) | ✓ (incl. GPU) | ✓ |
+| vLLM | ✓ (served = loaded) | – | ✓ (`max_model_len`) | – | ✓; KV cache via `/metrics` if enabled |
+| Other OpenAI-compatible | – | only if `/v1/models` says (llama.cpp) | – | – | if the server sends `usage` |
+
+When an engine reports no token usage, the worker estimates it from text
+length, and the client labels the numbers as estimated. Generation speed is
+timed by the worker.
+
+**Machine monitoring is off by default.** `relayllm monitoring on` shares
+these read-only values with authorized users:
+
+* total and available RAM, memory used %, and swap;
+* memory pressure: on macOS from `kern.memorystatus_vm_pressure_level`; on Linux from PSI (`/proc/pressure/memory`).
+
+Windows reports RAM only. Nothing else about the machine is exposed: no
+processes, paths, environment, or commands.
+
+Stats are read only while a client has the panel open, every
+`monitoring.intervalSec` seconds (default 10). Nothing is polled in the
+background.
 
 ## Run in the background
 

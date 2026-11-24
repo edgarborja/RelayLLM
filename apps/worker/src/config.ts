@@ -63,6 +63,16 @@ export const ConfigSchema = z.object({
       maxSystemPromptChars: z.number().int().min(0).default(32_000),
     })
     .prefault({}),
+  monitoring: z
+    .object({
+      /** Share machine memory stats with authorized users. Off unless the owner enables it. */
+      host: z.boolean().default(false),
+      /** How often clients refresh while their metrics panel is open. */
+      intervalSec: z.number().int().min(2).max(300).default(10),
+      /** vLLM: read the local Prometheus endpoint for KV-cache and queue stats. */
+      engineMetrics: z.boolean().default(false),
+    })
+    .prefault({}),
   streaming: z
     .object({
       batchMs: z.number().int().min(50).max(5000).default(250),

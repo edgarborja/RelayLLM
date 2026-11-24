@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { parsePairingUrl, type ChatHandle, type PairingInfo } from "@relayllm/nostr-transport";
 import { ERROR_TEXT, newId, type ErrorCode } from "@relayllm/protocol";
 import { ChatView } from "./components/ChatView.tsx";
+import { ContextIndicator } from "./components/ContextIndicator.tsx";
 import { AddWorkerDialog, SettingsDialog, type ThemePref } from "./components/Dialogs.tsx";
 import { Onboarding } from "./components/Onboarding.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
@@ -351,6 +352,7 @@ function Main({
           error: failed ? describeError(r.errorCode) : undefined,
           truncated: r.finishReason === "length" || undefined,
           incomplete: r.incomplete || undefined,
+          usage: r.usage,
         });
       } catch (e) {
         const code = (e as { code?: string }).code;
@@ -493,6 +495,17 @@ function Main({
         systemPromptName={conversation?.systemPrompt ? describePrompt(conversation.systemPrompt, library) : undefined}
         draftPromptName={draftPrompt.trim() ? describePrompt(draftPrompt, library) : undefined}
         onEditPrompt={() => setEditingPrompt(true)}
+        contextIndicator={
+          <ContextIndicator
+            source={worker ? conns.get(worker) : null}
+            ready={!!connState?.online && connState.access === "approved"}
+            model={model}
+            modelsKey={(connState?.models ?? []).map((m) => m.id).join("\n")}
+            messages={conversation && conversation.workerId === worker?.id ? conversation.messages : []}
+            systemPrompt={conversation ? conversation.systemPrompt : draftPrompt}
+            limits={connState?.limits}
+          />
+        }
         newChatAdvanced={
           <SystemPromptEditor
             value={draftPrompt}

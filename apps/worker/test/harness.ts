@@ -6,6 +6,7 @@ import { MockProvider, MockRelay, type MockProviderOptions, type MockRelayOption
 import { defaultConfig, type Config } from "../src/config.ts";
 import { silentLogger, createLogger } from "../src/log.ts";
 import { MemoryStore, SECRET_WORKER_KEY } from "../src/secrets.ts";
+import type { HostSampler } from "../src/host-metrics.ts";
 import { buildProvider, startWorker, type RunningWorker } from "../src/worker.ts";
 
 export interface Harness {
@@ -28,6 +29,7 @@ export async function makeHarness(
     provider?: MockProviderOptions;
     config?: (c: Config) => void;
     relayInstance?: MockRelay;
+    hostSampler?: HostSampler;
   } = {},
 ): Promise<Harness> {
   const relay = opts.relayInstance ?? (await MockRelay.start(opts.relay));
@@ -49,6 +51,7 @@ export async function makeHarness(
     provider: buildProvider(config, store),
     log: process.env.TEST_LOG ? createLogger("debug") : silentLogger,
     writeStatus: false,
+    hostSampler: opts.hostSampler,
   });
   await waitFor(() => worker.pool.connectedCount > 0);
   await sleep(50);

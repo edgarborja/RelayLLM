@@ -9,7 +9,7 @@ import {
   type RelayStatus,
   type Signer,
 } from "@relayllm/nostr-transport";
-import type { ChatMessage, ChatParams, Limits, ModelInfo } from "@relayllm/protocol";
+import type { ChatMessage, ChatParams, Limits, MetricsResult, ModelInfo } from "@relayllm/protocol";
 import type { WorkerProfile } from "./db.ts";
 
 export type AccessState = "unknown" | "checking" | "approved" | "unauthorized" | "pending" | "unreachable";
@@ -124,6 +124,11 @@ export class WorkerConnection {
     } catch (e) {
       this.#set(errorToState(e));
     }
+  }
+
+  /** Read-only metrics (model metadata; machine stats if `host` and enabled by the owner). */
+  metrics(opts: { model?: string; host?: boolean }): Promise<MetricsResult> {
+    return this.client.metrics(opts);
   }
 
   chat(req: { model: string; messages: ChatMessage[]; params?: ChatParams }, cb: ChatCallbacks): ChatHandle {

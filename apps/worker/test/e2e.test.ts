@@ -401,3 +401,103 @@ describe("system prompts", () => {
     expect((await c.serverInfo()).limits.maxSystemPromptChars).toBe(32_000);
   });
 });
+
+describe("metrics", () => {
+  const fakeHost = () => {
+    const calls = { n: 0 };
+    const sampler = async () => {
+      calls.n++;
+      return {
+        at: Date.now(),
+        platform: "linux" as const,
+        memTotalBytes: 32e9,
+        memAvailableBytes: 12e9,
+        memUsedPercent: 62.5,
+        swapTotalBytes: 2e9,
+        swapUsedBytes: 0,
+        pressure: "normal" as const,
+      };
+    };
+    return { calls, sampler };
+  };
+
+  it("returns model metadata, keeping maximum and loaded context apart", async () => {
+    const h = await harness();
+    const c = await ready(h.client(h.newUser()));
+    const r = await c.metrics({ model: "mock-llm-small" });
+    expect(r.provider).toBe("lmstudio");
+    expect(r.model).toMatchObject({ id: "mock-llm-small", state: "loaded", maxContext: 32768, loadedContext: 4096, sizeBytes: 1_500_000_000, memoryBytes: null });
+    const other = await c.metrics({ model: "mock-llm-large" });
+    expect(other.model).toMatchObject({ state: "not-loaded", maxContext: 32768, loadedContext: null });
+    expect(r.engine).toBeNull();
+    expect(r.monitoring).toEqual({ host: false, refreshSec: 10 });
+  });
+
+  it("only serves explicitly authorized users, and only exposed models", async () => {
+    const host = fakeHost();
+    const h = await harness({ hostSampler: host.sampler, config: (cfg) => (cfg.monitoring.host = true) });
+    const outsider = await ready(h.client(h.newUser(false)));
+    await expect(outsider.metrics({ model: "mock-llm-small", host: true })).rejects.toMatchObject({ code: "unauthorized" });
+    h.config.access.mode = "public"; // anonymous public users can chat, but not read metrics
+    await expect(outsider.metrics({ host: true })).rejects.toMatchObject({ code: "unauthorized" });
+    expect(host.calls.n).toBe(0);
+
+    const c = await ready(h.client(h.newUser()));
+    await expect(c.metrics({ model: "mock-embed" })).rejects.toMatchObject({ code: "model_unavailable" });
+    await expect(c.metrics({ model: "../../api/v0/models/unload" })).rejects.toMatchObject({ code: "model_unavailable" });
+    // Only fixed read-only engine endpoints were touched.
+    for (const p of new Set(h.provider.requests.map((r) => r.path))) expect(["/v1/models", "/api/v0/models", "/api/v1/models"]).toContain(p);
+  });
+
+  it("keeps host monitoring off by default and samples only on request when enabled", async () => {
+    const host = fakeHost();
+    const h = await harness({ hostSampler: host.sampler, config: (cfg) => (cfg.monitoring.intervalSec = 2) });
+    const c = await ready(h.client(h.newUser()));
+    const off = await c.metrics({ host: true });
+    expect(off.host).toBeNull();
+    expect(off.monitoring.host).toBe(false);
+    expect(host.calls.n).toBe(0);
+
+    h.config.monitoring.host = true; // what `relayllm monitoring on` does
+    await sleep(1200);
+    expect(host.calls.n).toBe(0); // nothing is polled in the background
+    const on = await c.metrics({ host: true });
+    expect(on.host).toMatchObject({ platform: "linux", memTotalBytes: 32e9, memAvailableBytes: 12e9, pressure: "normal" });
+    expect(on.monitoring).toEqual({ host: true, refreshSec: 2 });
+    await c.metrics({ host: true }); // within half the interval: cached
+    expect(host.calls.n).toBe(1);
+    await c.metrics({ model: "mock-llm-small" }); // host not requested
+    expect(host.calls.n).toBe(1);
+    await sleep(1100);
+    await c.metrics({ host: true });
+    expect(host.calls.n).toBe(2);
+
+    h.config.monitoring.host = false;
+    expect((await c.metrics({ host: true })).host).toBeNull();
+    expect(host.calls.n).toBe(2);
+  });
+
+  it("does not use the chat rate limit", async () => {
+    const h = await harness({ config: (cfg) => (cfg.limits.requestsPerMinute = 2) });
+    const c = await ready(h.client(h.newUser()));
+    for (let i = 0; i < 6; i++) await c.metrics({ model: "mock-llm-small" });
+    expect((await ask(c, "still allowed").result).finishReason).toBe("stop");
+  });
+
+  it("reports measured usage and speed after each request, or estimates when the engine doesn't", async () => {
+    const h = await harness({ provider: { reasoning: "let me think", tokenDelayMs: 25 } });
+    const c = await ready(h.client(h.newUser()));
+    const r = await ask(c, "count my tokens please").result;
+    expect(r.usage).toMatchObject({ source: "measured", reasoningTokens: 3, promptTokens: 4 + Math.ceil("count my tokens please".length / 4) });
+    expect(r.usage!.completionTokens).toBe(3 + (r.content.match(/\S+\s*|\s+/g) ?? []).length);
+    expect(r.usage!.tokensPerSecond).toBeGreaterThan(0);
+    expect(r.usage!.firstTokenMs).toBeGreaterThanOrEqual(0);
+    expect(r.usage!.generationMs).toBeGreaterThan(0);
+
+    const h2 = await harness({ provider: { usage: false } });
+    const c2 = await ready(h2.client(h2.newUser()));
+    const r2 = await ask(c2, "abcdefgh").result;
+    expect(r2.usage).toMatchObject({ source: "estimated", promptTokens: 4 + 2, completionTokens: Math.ceil(r2.content.length / 4) });
+    expect(r2.usage!.reasoningTokens).toBeUndefined();
+  });
+});

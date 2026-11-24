@@ -453,6 +453,7 @@ a {
   height: 100%;
 }
 .chat-head {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1121,4 +1122,159 @@ a {
   color: var(--text-muted);
   max-height: 220px;
   overflow-y: auto;
+}
+
+/* ------------------------------------------------------------ context indicator */
+.ctx {
+  position: relative;
+}
+.ctx-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  padding: 5px 7px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+.ctx-btn:hover,
+.ctx-btn[aria-expanded="true"] {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.ctx-btn.warn {
+  color: var(--warn);
+}
+.ctx-btn.danger {
+  color: var(--danger);
+}
+.ring circle {
+  fill: none;
+  stroke-width: 2.4;
+}
+.ring-track {
+  stroke: var(--border-strong);
+}
+.ring-fill {
+  stroke: var(--accent);
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-origin: 9px 9px;
+}
+.ring.warn .ring-fill {
+  stroke: var(--warn);
+}
+.ring.danger .ring-fill {
+  stroke: var(--danger);
+}
+.ctx-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  width: min(360px, calc(100vw - 24px));
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+  padding: 12px 14px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: 0.85rem;
+}
+.ctx-panel section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ctx-panel section + section {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+.ctx-panel h4 {
+  margin: 0;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.ctx-panel p {
+  margin: 0;
+}
+.ctx-headline {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.metrics-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0;
+}
+.metrics-grid dt {
+  color: var(--text-muted);
+}
+.metrics-grid dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.meter {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+.meter > div {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+}
+.meter.warn > div {
+  background: var(--warn);
+}
+.meter.danger > div {
+  background: var(--danger);
+}
+.pressure.warning {
+  color: var(--warn);
+}
+.pressure.critical {
+  color: var(--danger);
+}
+.ctx-foot {
+  text-align: right;
+}
+@media (max-width: 640px) {
+  .ctx {
+    position: static;
+  }
+  .ctx-panel {
+    left: 12px;
+    right: 12px;
+    width: auto;
+    top: 56px;
+  }
+}
+.selector-btn {
+  max-width: 100%;
+  min-width: 0;
+}
+.ctx {
+  flex-shrink: 0;
+}
+@media (max-width: 640px) {
+  .chat-head {
+    gap: 2px;
+    padding: 8px 6px;
+  }
+  .selector-btn {
+    padding: 7px 6px;
+    max-width: 38vw;
+  }
 }

@@ -16,12 +16,31 @@
 
 The gateway is an inference gateway, not a proxy:
 
-* The only provider HTTP calls are `GET {base}/models`, `POST {base}/chat/completions`, and the engine's read-only discovery endpoints (`/api/v0/models` for LM Studio; `/api/tags` and `/api/version` for Ollama).
+* The only provider HTTP calls are `GET {base}/models`, `POST {base}/chat/completions`, and the engine's fixed, read-only metadata endpoints:
+  * LM Studio: `/api/v1/models`, `/api/v0/models`.
+  * Ollama: `/api/tags`, `/api/version`, `/api/ps`, `POST /api/show` with an exposed model id.
+  * vLLM: `/metrics`, only with `monitoring.engineMetrics`; only an allowlist of samples is parsed.
 * The provider base URL comes from local config only. By default it must be loopback. Redirects are refused.
 * Requests are rebuilt from allowlisted fields: `model`, `messages[role, content]`, `temperature`, `top_p`, `max_tokens`. Tools, functions, `response_format`, extra roles and unknown fields are rejected by the schema.
 * A model must be explicitly exposed (`relayllm models enable`).
 * No shell, filesystem, model management, MCP, or agent features exist in the code.
 * System prompts are ordinary model input. They may only lead the conversation and are size-capped (`limits.maxSystemPromptChars`). They can't change access, models, limits or the provider. The worker owner chooses how they're delivered to the engine. A prompt can still steer the model's answers, as any user message can, so it is not a security boundary for what the model *says*.
+
+## Metrics
+
+* `metrics.get` is answered only to users on the allowlist. Unknown users and anonymous public-mode users get `unauthorized`. A model must be one exposed to the caller.
+* The response is a fixed, schema-validated set of numbers and short labels:
+  * model state and context sizes;
+  * model memory and size;
+  * optional vLLM KV-cache and queue counts;
+  * optional machine RAM, swap and memory pressure.
+* Engine responses are never forwarded. Labels are truncated to printable ASCII.
+* **Machine monitoring is off by default** (`relayllm monitoring on`). When it's on:
+  * the worker reads `os` totals, `/proc/meminfo` and `/proc/pressure/memory` on Linux, or two fixed commands on macOS (`/usr/bin/vm_stat` and `/usr/sbin/sysctl -n` with fixed keys; absolute paths, no shell);
+  * no client input reaches them;
+  * process lists, paths, environment variables and hostnames are never collected.
+* Sampling happens only when an authorized client asks: it polls while its panel is open. Samples are cached for half the refresh interval, and metrics requests have their own rate limit.
+* Exposing memory figures tells authorized users roughly how loaded your machine is. That's why this is opt-in.
 
 ## Metadata visible to relays
 

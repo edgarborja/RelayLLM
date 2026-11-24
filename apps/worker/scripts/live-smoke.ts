@@ -20,7 +20,8 @@ const prompt = process.env.PROMPT ?? "In two sentences, what is Nostr?";
 
 const user = new LocalSigner(generateSecretKey());
 const cfg = defaultConfig({ name: "Live smoke", keyStorage: "file", relays: [relayUrl] });
-cfg.provider = { kind: "lmstudio", baseUrl: providerUrl, allowRemoteEndpoint: false, streaming: true, hasApiKey: false };
+cfg.provider = { ...cfg.provider, kind: "lmstudio", baseUrl: providerUrl, allowRemoteEndpoint: false, streaming: true, hasApiKey: false };
+cfg.monitoring.host = process.env.HOST_METRICS !== "0";
 cfg.models.exposed = [model];
 cfg.access.users.push({ pubkey: user.pubkey, addedAt: Date.now() });
 cfg.limits.maxTokens = Number(process.env.MAX_TOKENS ?? 1024);
@@ -58,6 +59,9 @@ const h = client.chat(
 if (process.env.CANCEL_AFTER_MS) setTimeout(() => void h.cancel(), Number(process.env.CANCEL_AFTER_MS));
 const r = await h.result;
 console.log(`\n---\nfinish=${r.finishReason} first-update=${first}ms total=${Date.now() - t}ms updates=${updates} content=${r.content.length}ch reasoning=${r.reasoning.length}ch usage=${JSON.stringify(r.usage)} incomplete=${r.incomplete}`);
+t = Date.now();
+const metrics = await client.metrics({ model, host: true });
+console.log(`metrics (${Date.now() - t}ms):`, JSON.stringify({ model: metrics.model, host: metrics.host, monitoring: metrics.monitoring }, null, 1));
 client.stop();
 pool.close();
 await worker.stop();

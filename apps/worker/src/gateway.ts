@@ -6,13 +6,16 @@ import {
   type ClientMessage,
   type ClientMessageOf,
   type ErrorCode,
+  type HostMetrics,
   type ModelInfo,
+  type ModelMetrics,
   type WorkerDraft,
 } from "@relayllm/protocol";
 import { ProviderError, type ChatRequest, type ProviderAdapter, type ProviderModel } from "@relayllm/provider-adapters";
 import { hexToNpub, type IncomingMessage } from "@relayllm/nostr-transport";
 import { addPending, authorize, DailyQuota, RateLimiter, redeemInvite, type Authorization } from "./access.ts";
 import type { Config } from "./config.ts";
+import { sampleHost, type HostSampler } from "./host-metrics.ts";
 import type { Logger } from "./log.ts";
 
 export const SOFTWARE = "relayllm-worker/0.1.0";
@@ -26,6 +29,8 @@ export interface GatewayDeps {
   send: (recipient: string, message: object) => Promise<unknown>;
   log: Logger;
   now?: () => number;
+  /** Machine stats source (injectable for tests). Only called on request, never polled. */
+  hostSampler?: HostSampler;
 }
 
 interface StreamDelta {
@@ -68,6 +73,10 @@ export class Gateway {
   readonly #deniedGlobal = new RateLimiter(60, 30);
   readonly #pairLimiter = new RateLimiter(5, 5);
   #modelCache: { at: number; models: ProviderModel[] | null } = { at: 0, models: null };
+  /** Metrics requests have their own budget so an open panel never eats into chat limits. */
+  readonly #metricsLimiter = new RateLimiter(30, 10);
+  readonly #modelInfoCache = new Map<string, { at: number; value: Promise<ModelMetrics | null> }>();
+  #hostCache: { at: number; value: Promise<HostMetrics | null> } | null = null;
 
   constructor(deps: GatewayDeps) {
     this.#d = deps;
@@ -137,6 +146,14 @@ export class Gateway {
 
     if (msg.size > cfg.limits.maxRequestBytes) return this.#error(replyTo, "too_large", m.id);
 
+    if (m.type === "metrics.get") {
+      // Explicitly authorized users only (not anonymous public-mode users).
+      if (auth !== "user") return this.#error(replyTo, "unauthorized", m.id);
+      const wait = this.#metricsLimiter.take(msg.sender, this.#now());
+      if (wait > 0) return this.#error(replyTo, "rate_limited", m.id, { retryAfter: wait });
+      return this.#metrics(replyTo, m);
+    }
+
     switch (m.type) {
       case "chat.cancel":
         return this.#cancel(msg.sender, m);
@@ -175,6 +192,82 @@ export class Gateway {
       case "chat.start":
         return this.#chat(msg.sender, replyTo, m);
     }
+  }
+
+  async #metrics(replyTo: string, m: ClientMessageOf<"metrics.get">): Promise<void> {
+    const cfg = this.#d.getConfig();
+    if (m.model && !cfg.models.exposed.includes(m.model)) return this.#error(replyTo, "model_unavailable", m.id);
+    const [model, engine, host] = await Promise.all([
+      m.model ? this.modelMetrics(m.model) : null,
+      cfg.monitoring.engineMetrics ? this.#engineMetrics() : null,
+      m.host && cfg.monitoring.host ? this.#hostMetrics(cfg.monitoring.intervalSec) : null,
+    ]);
+    return this.#reply(replyTo, {
+      type: "metrics.result",
+      re: m.id,
+      at: this.#now(),
+      provider: cfg.provider.kind,
+      model,
+      engine,
+      host,
+      monitoring: { host: cfg.monitoring.host, refreshSec: cfg.monitoring.intervalSec },
+    });
+  }
+
+  /** Model metadata, cached briefly (load state can change with JIT loading). */
+  modelMetrics(id: string): Promise<ModelMetrics | null> {
+    const now = this.#now();
+    const hit = this.#modelInfoCache.get(id);
+    if (hit && now - hit.at < 3000) return hit.value;
+    const value = this.#d.provider.modelInfo(id).then(
+      (i): ModelMetrics => ({
+        id,
+        at: this.#now(),
+        state: i.state,
+        maxContext: i.maxContext ?? null,
+        loadedContext: i.loadedContext ?? null,
+        memoryBytes: i.memoryBytes ?? null,
+        vramBytes: i.vramBytes ?? null,
+        sizeBytes: i.sizeBytes ?? null,
+        architecture: i.architecture ?? null,
+        quantization: i.quantization ?? null,
+        parameters: i.parameters ?? null,
+      }),
+      (e) => {
+        this.#d.log.debug("model metrics unavailable", { model: id, error: (e as Error).message });
+        return null;
+      },
+    );
+    if (this.#modelInfoCache.size > 200) this.#modelInfoCache.clear();
+    this.#modelInfoCache.set(id, { at: now, value });
+    return value;
+  }
+
+  async #engineMetrics() {
+    try {
+      const s = await this.#d.provider.engineStats();
+      if (!s) return null;
+      return {
+        at: this.#now(),
+        kvCacheUsage: s.kvCacheUsage ?? null,
+        requestsRunning: s.requestsRunning ?? null,
+        requestsWaiting: s.requestsWaiting ?? null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Sampled only when an authorized client asks; reused within half the refresh interval. */
+  #hostMetrics(intervalSec: number): Promise<HostMetrics | null> {
+    const now = this.#now();
+    if (this.#hostCache && now - this.#hostCache.at < (intervalSec * 1000) / 2) return this.#hostCache.value;
+    const value = (this.#d.hostSampler ?? sampleHost)().catch((e) => {
+      this.#d.log.debug("host metrics failed", { error: (e as Error).message });
+      return null;
+    });
+    this.#hostCache = { at: now, value };
+    return value;
   }
 
   async #pair(sender: string, replyTo: string, m: ClientMessageOf<"pair.request">, auth: Authorization): Promise<void> {
@@ -291,7 +384,9 @@ export class Gateway {
 
     let finishReason: "stop" | "length" | "cancelled" | "error" | "timeout" = "stop";
     let errorCode: ErrorCode | undefined;
-    let usage: { promptTokens?: number; completionTokens?: number } | undefined;
+    let usage: { promptTokens?: number; completionTokens?: number; reasoningTokens?: number } | undefined;
+    const startedAt = this.#now();
+    let firstTokenAt: number | undefined;
     try {
       for await (const chunk of this.#d.provider.chat(req, s.controller.signal)) {
         if (chunk.type === "done") {
@@ -299,6 +394,7 @@ export class Gateway {
           usage = chunk.usage;
           break;
         }
+        firstTokenAt ??= this.#now();
         if (chunk.type === "content") {
           s.pendingContent += chunk.text;
           s.contentLength += chunk.text.length;
@@ -332,6 +428,7 @@ export class Gateway {
       finishReason = s.cancelReason === "length" ? "length" : s.cancelReason;
       if (s.cancelReason === "timeout") errorCode = "timeout";
     }
+    const finalUsage = completeUsage(usage, m.messages, s.totalChars, startedAt, firstTokenAt, this.#now());
 
     // Final flush, then completion.
     while (s.inFlight || s.pendingContent || s.pendingReasoning) {
@@ -350,7 +447,7 @@ export class Gateway {
       finishReason,
       errorCode,
       contentLength: s.contentLength,
-      usage,
+      usage: finalUsage,
     };
     await this.#reply(s.replyTo, s.completion);
     this.#d.log.info("chat finished", { req: m.id.slice(0, 8), finishReason, deltas: s.deltas.length, chars: s.totalChars });
@@ -435,6 +532,40 @@ export class Gateway {
       if (s.flushTimer) clearTimeout(s.flushTimer);
     }
   }
+}
+
+/** Rough token estimate for text when the engine reports no usage (~4 chars/token). */
+export const estimateTokens = (chars: number) => Math.ceil(chars / 4);
+
+/**
+ * Token counts for chat.complete: the engine's when it reports them
+ * ("measured"), otherwise estimated from text length ("estimated"), plus
+ * timing measured by the worker around the engine stream.
+ */
+export function completeUsage(
+  reported: { promptTokens?: number; completionTokens?: number; reasoningTokens?: number } | undefined,
+  messages: readonly { content: string }[],
+  outputChars: number,
+  startedAt: number,
+  firstTokenAt: number | undefined,
+  endedAt: number,
+) {
+  const measured = reported?.promptTokens !== undefined && reported?.completionTokens !== undefined;
+  const promptTokens = reported?.promptTokens ?? messages.reduce((n, x) => n + 4 + estimateTokens(x.content.length), 0);
+  const completionTokens = reported?.completionTokens ?? estimateTokens(outputChars);
+  const generationMs = firstTokenAt !== undefined ? Math.max(0, endedAt - firstTokenAt) : undefined;
+  return {
+    promptTokens,
+    completionTokens,
+    reasoningTokens: reported?.reasoningTokens,
+    source: measured ? ("measured" as const) : ("estimated" as const),
+    firstTokenMs: firstTokenAt !== undefined ? Math.max(0, firstTokenAt - startedAt) : undefined,
+    generationMs,
+    tokensPerSecond:
+      generationMs !== undefined && generationMs >= 50 && completionTokens > 0
+        ? Math.round((completionTokens / (generationMs / 1000)) * 10) / 10
+        : undefined,
+  };
 }
 
 function replyToOf(payload: unknown): string | undefined {
