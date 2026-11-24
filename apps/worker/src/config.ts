@@ -2,6 +2,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, w
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { SYSTEM_PROMPT_STYLES } from "@relayllm/provider-adapters";
 
 export const DEFAULT_RELAYS = ["wss://relay.k1.sv", "wss://nos.lol", "wss://relay.damus.io"];
 /** No default: pairing links must point at a client deployment you control. */
@@ -20,12 +21,16 @@ export const ConfigSchema = z.object({
     streaming: z.boolean().default(true),
     /** Whether an API key is stored in the secret store. */
     hasApiKey: z.boolean().default(false),
+    /** How system instructions reach the engine (see provider-adapters/system-prompt.ts). */
+    systemPromptStyle: z.enum(SYSTEM_PROMPT_STYLES).default("system"),
   }),
   models: z.object({
     /** Models remote clients may use. Nothing is exposed unless listed. */
     exposed: z.array(z.string().min(1).max(256)).default([]),
     /** Models that exist even though discovery doesn't report them. */
     manual: z.array(z.string().min(1).max(256)).default([]),
+    /** Per-model override of provider.systemPromptStyle. */
+    systemPromptStyle: z.record(z.string().min(1).max(256), z.enum(SYSTEM_PROMPT_STYLES)).default({}),
   }),
   relays: z.array(z.string()).min(1),
   clientUrl: z.string().refine((u) => u === "" || /^https?:\/\//.test(u), "must be an http(s) URL").default(DEFAULT_CLIENT_URL),
@@ -54,6 +59,8 @@ export const ConfigSchema = z.object({
       maxResponseChars: z.number().int().min(100).default(200_000),
       /** Upper bound applied to max_tokens; also used when the client sends none. */
       maxTokens: z.number().int().min(1).default(8192),
+      /** Total size of the client's system instructions. */
+      maxSystemPromptChars: z.number().int().min(0).default(32_000),
     })
     .prefault({}),
   streaming: z

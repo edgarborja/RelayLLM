@@ -167,6 +167,7 @@ export class Gateway {
             maxResponseChars: cfg.limits.maxResponseChars,
             maxMessages: cfg.limits.maxMessages,
             requestTimeoutSec: cfg.limits.requestTimeoutSec,
+            maxSystemPromptChars: cfg.limits.maxSystemPromptChars,
           },
         });
       case "models.list":
@@ -234,6 +235,17 @@ export class Gateway {
     }
     if (m.messages.length > cfg.limits.maxMessages) return this.#error(replyTo, "too_large", m.id, { message: "Too many messages in conversation." });
     if (!cfg.models.exposed.includes(m.model)) return this.#error(replyTo, "model_unavailable", m.id);
+    // System instructions are plain text for the model, nothing more: they may
+    // only lead the conversation, are size-capped, and never touch access,
+    // provider, or limit settings (all of which come from this worker's config).
+    const firstNonSystem = m.messages.findIndex((x) => x.role !== "system");
+    if (firstNonSystem === -1 || m.messages.slice(firstNonSystem).some((x) => x.role === "system")) {
+      return this.#error(replyTo, "invalid_request", m.id, { message: "System instructions must come first, before the conversation." });
+    }
+    const systemChars = m.messages.slice(0, firstNonSystem).reduce((n, x) => n + x.content.length, 0);
+    if (systemChars > cfg.limits.maxSystemPromptChars) {
+      return this.#error(replyTo, "too_large", m.id, { message: "The system prompt is longer than this worker allows." });
+    }
 
     const active = [...this.#streams.values()].filter((s) => !s.done);
     if (active.length >= cfg.limits.maxConcurrent) return this.#error(replyTo, "busy", m.id, { retryAfter: 5 });
@@ -274,6 +286,7 @@ export class Gateway {
       temperature: m.params?.temperature,
       top_p: m.params?.top_p,
       max_tokens: Math.min(m.params?.max_tokens ?? cfg.limits.maxTokens, cfg.limits.maxTokens),
+      systemPromptStyle: cfg.models.systemPromptStyle[m.model] ?? cfg.provider.systemPromptStyle,
     };
 
     let finishReason: "stop" | "length" | "cancelled" | "error" | "timeout" = "stop";

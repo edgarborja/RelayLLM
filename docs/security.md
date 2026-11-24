@@ -21,6 +21,7 @@ The gateway is an inference gateway, not a proxy:
 * Requests are rebuilt from allowlisted fields: `model`, `messages[role, content]`, `temperature`, `top_p`, `max_tokens`. Tools, functions, `response_format`, extra roles and unknown fields are rejected by the schema.
 * A model must be explicitly exposed (`relayllm models enable`).
 * No shell, filesystem, model management, MCP, or agent features exist in the code.
+* System prompts are ordinary model input. They may only lead the conversation and are size-capped (`limits.maxSystemPromptChars`). They can't change access, models, limits or the provider. The worker owner chooses how they're delivered to the engine. A prompt can still steer the model's answers, as any user message can, so it is not a security boundary for what the model *says*.
 
 ## Metadata visible to relays
 
@@ -42,7 +43,7 @@ Relays cannot see prompts, responses, model names, your identity, or the worker'
 
 ## Browser storage threat model
 
-Conversations and the worker list are encrypted in IndexedDB with AES-256-GCM, bound to their record id. The key is a random data key, stored NIP-44-encrypted to your own pubkey, and only an unlocked identity can recover it.
+Conversations (including each one's system prompt), saved system prompts, the default prompt, and the worker list are encrypted in IndexedDB with AES-256-GCM, bound to their record id. Older versions kept one global system prompt in plaintext `localStorage`. It is moved into the encrypted store, and removed from `localStorage`, the first time the identity is unlocked. The key is a random data key, stored NIP-44-encrypted to your own pubkey, and only an unlocked identity can recover it.
 
 Protected against: someone copying the browser profile while the app is locked; other identities using the same browser.
 

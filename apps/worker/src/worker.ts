@@ -25,6 +25,7 @@ export function buildProvider(cfg: Config, store: SecretStore | null): ProviderA
     apiKey,
     allowRemoteEndpoint: cfg.provider.allowRemoteEndpoint,
     streaming: cfg.provider.streaming,
+    systemPromptStyle: cfg.provider.systemPromptStyle,
   });
 }
 

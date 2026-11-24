@@ -1,5 +1,6 @@
 import { checkProviderEndpoint } from "./endpoint-policy.ts";
 import { readSse } from "./sse.ts";
+import { applySystemPromptStyle, type SystemPromptStyle } from "./system-prompt.ts";
 import {
   ProviderError,
   type ChatChunk,
@@ -20,6 +21,8 @@ export interface OpenAICompatibleOptions {
   streaming?: boolean;
   /** Timeout for discovery/health calls. */
   metaTimeoutMs?: number;
+  /** Default convention for system instructions (see system-prompt.ts). */
+  systemPromptStyle?: SystemPromptStyle;
   fetchImpl?: typeof fetch;
 }
 
@@ -37,6 +40,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
   protected readonly apiKey?: string;
   protected readonly metaTimeoutMs: number;
   protected readonly fetch: typeof fetch;
+  protected readonly systemPromptStyle: SystemPromptStyle;
   readonly #streaming: boolean;
 
   constructor(opts: OpenAICompatibleOptions) {
@@ -47,6 +51,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     this.metaTimeoutMs = opts.metaTimeoutMs ?? 5000;
     this.fetch = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.#streaming = opts.streaming ?? true;
+    this.systemPromptStyle = opts.systemPromptStyle ?? "system";
     this.capabilities = { streaming: this.#streaming, cancel: true, discovery: true };
   }
 
@@ -118,7 +123,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     // Allowlisted body: no tools, functions, response_format, logit_bias, etc.
     const body: Record<string, unknown> = {
       model: req.model,
-      messages: req.messages.map((m) => ({ role: m.role, content: m.content })),
+      messages: applySystemPromptStyle(req.messages, req.systemPromptStyle ?? this.systemPromptStyle),
       stream: this.#streaming,
     };
     if (req.temperature !== undefined) body.temperature = req.temperature;

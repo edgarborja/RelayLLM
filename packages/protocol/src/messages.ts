@@ -128,6 +128,8 @@ export const Limits = z.object({
   maxResponseChars: z.number().int(),
   maxMessages: z.number().int(),
   requestTimeoutSec: z.number().int(),
+  /** Max total length of leading system instructions (optional for older workers). */
+  maxSystemPromptChars: z.number().int().optional(),
 });
 export type Limits = z.infer<typeof Limits>;
 

@@ -1,10 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { hexToNpub } from "@relayllm/nostr-transport";
 import type { ModelInfo } from "@relayllm/protocol";
 import type { ChatMessageRecord, Conversation, WorkerProfile } from "../lib/db.ts";
 import type { ConnectionState } from "../lib/connection.ts";
 import { CopyButton, Markdown } from "./Markdown.tsx";
-import { IconChevron, IconMenu, IconPlus, IconRefresh, IconSend, IconServer, IconStop } from "./icons.tsx";
+import { IconChevron, IconMenu, IconPlus, IconRefresh, IconSend, IconServer, IconSliders, IconStop } from "./icons.tsx";
 
 export interface ChatViewProps {
   conversation: Conversation | null;
@@ -23,6 +23,13 @@ export interface ChatViewProps {
   onRefresh: () => void;
   onRequestAccess: () => void;
   onToggleSidebar: () => void;
+  /** Name of the open conversation's system prompt, if it has one. */
+  systemPromptName?: string;
+  /** Name of the prompt a new conversation would start with, if any. */
+  draftPromptName?: string;
+  onEditPrompt: () => void;
+  /** Advanced settings for a new conversation (the system prompt editor). */
+  newChatAdvanced: ReactNode;
 }
 
 function StatusDot({ conn }: { conn: ConnectionState | null }) {
@@ -279,6 +286,16 @@ export function ChatView(p: ChatViewProps) {
           <Selector value={p.model} placeholder="Choose model" items={models.map((m) => ({ id: m.id, label: modelLabel(m) }))} onChange={p.onSelectModel} />
         )}
         <div className="spacer" />
+        {p.conversation && messages.length > 0 && (
+          <button
+            className={`icon-btn ${p.systemPromptName ? "accent" : ""}`}
+            onClick={p.onEditPrompt}
+            title={p.systemPromptName ? `System prompt: ${p.systemPromptName}` : "Add a system prompt"}
+            aria-label="System prompt"
+          >
+            <IconSliders />
+          </button>
+        )}
         <StatusDot conn={p.conn} />
       </header>
 
@@ -312,7 +329,19 @@ export function ChatView(p: ChatViewProps) {
                 Chatting with <strong>{p.model || "…"}</strong> on <strong>{p.worker.name}</strong>. Messages are end-to-end encrypted between this browser and your worker.
               </p>
               {models.length === 0 && <p className="error-text">This worker exposes no models to you.</p>}
+              <details className="advanced">
+                <summary>
+                  <IconSliders /> Advanced settings
+                  {p.draftPromptName && <span className="muted"> · System prompt: {p.draftPromptName}</span>}
+                </summary>
+                {p.newChatAdvanced}
+              </details>
             </div>
+          )}
+          {p.conversation && p.systemPromptName && messages.length > 0 && (
+            <button className="system-chip" onClick={p.onEditPrompt} title="View or edit the system prompt">
+              <IconSliders /> <span className="ellipsis">System prompt: {p.systemPromptName}</span>
+            </button>
           )}
           {messages.map((m, i) => (
             <Message key={m.id} m={m} isLast={i === messages.length - 1} streaming={p.streaming} onRegenerate={p.onRegenerate} />

@@ -1,4 +1,5 @@
 import { openDB, deleteDB, type IDBPDatabase } from "idb";
+import type { SavedPrompt } from "./prompts.ts";
 
 /**
  * Local, encrypted persistence (IndexedDB).
@@ -43,6 +44,18 @@ export interface Conversation {
   createdAt: number;
   updatedAt: number;
   messages: ChatMessageRecord[];
+  /**
+   * System prompt sent first with every request in this conversation.
+   * Absent in conversations created before system prompts existed, which
+   * means no system prompt. Editing it affects only later requests.
+   */
+  systemPrompt?: string;
+}
+
+/** Encrypted, per-identity settings (unlike prefs in localStorage). */
+export interface PrivateSettings {
+  /** Pre-filled system prompt for new conversations. */
+  defaultPrompt?: string;
 }
 
 interface EncRecord {
@@ -52,7 +65,7 @@ interface EncRecord {
   ct: ArrayBuffer;
 }
 
-type Store = "workers" | "conversations";
+type Store = "workers" | "conversations" | "prompts" | "settings";
 
 export class LocalDB {
   private constructor(
@@ -67,10 +80,16 @@ export class LocalDB {
 
   static async open(pubkey: string, dataKey: Uint8Array): Promise<LocalDB> {
     const name = LocalDB.dbName(pubkey);
-    const db = await openDB(name, 1, {
-      upgrade(d) {
-        d.createObjectStore("workers", { keyPath: "id" });
-        d.createObjectStore("conversations", { keyPath: "id" }).createIndex("updatedAt", "updatedAt");
+    const db = await openDB(name, 2, {
+      upgrade(d, oldVersion) {
+        if (oldVersion < 1) {
+          d.createObjectStore("workers", { keyPath: "id" });
+          d.createObjectStore("conversations", { keyPath: "id" }).createIndex("updatedAt", "updatedAt");
+        }
+        if (oldVersion < 2) {
+          d.createObjectStore("prompts", { keyPath: "id" });
+          d.createObjectStore("settings", { keyPath: "id" });
+        }
       },
     });
     const key = await crypto.subtle.importKey("raw", dataKey as BufferSource, "AES-GCM", false, ["encrypt", "decrypt"]);
@@ -131,6 +150,26 @@ export class LocalDB {
   }
   async deleteAllConversations(): Promise<void> {
     await this.db.clear("conversations");
+  }
+
+  // system prompt library
+  listPrompts(): Promise<SavedPrompt[]> {
+    return this.#all<SavedPrompt>("prompts");
+  }
+  savePrompt(p: SavedPrompt): Promise<void> {
+    return this.#put("prompts", p.id, p.updatedAt, p);
+  }
+  async deletePrompt(id: string): Promise<void> {
+    await this.db.delete("prompts", id);
+  }
+
+  // settings
+  async getSettings(): Promise<PrivateSettings> {
+    const r = (await this.db.get("settings", "settings")) as EncRecord | undefined;
+    return (r && (await this.#decrypt<PrivateSettings>("settings", r))) || {};
+  }
+  saveSettings(s: PrivateSettings): Promise<void> {
+    return this.#put("settings", "settings", Date.now(), s);
   }
 
   close(): void {

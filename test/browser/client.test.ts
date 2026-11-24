@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { chromium, type Browser, type Page } from "playwright";
 import { MockProvider, MockRelay } from "@relayllm/test-utils";
 import { buildPairingUrl } from "@relayllm/nostr-transport";
+import { TEMPLATES } from "../../apps/client/src/lib/prompts.ts";
 import { createInvite } from "../../apps/worker/src/access.ts";
 import { defaultConfig, type Config } from "../../apps/worker/src/config.ts";
 import { silentLogger } from "../../apps/worker/src/log.ts";
@@ -60,7 +61,7 @@ beforeAll(async () => {
   const store = new MemoryStore();
   store.set(SECRET_WORKER_KEY, "1".repeat(63) + "2");
   config = defaultConfig({ name: "Test Box", keyStorage: "file", relays: [relay.url] });
-  config.provider = { kind: "lmstudio", baseUrl: provider.baseUrl, allowRemoteEndpoint: false, streaming: true, hasApiKey: false };
+  config.provider = { kind: "lmstudio", baseUrl: provider.baseUrl, allowRemoteEndpoint: false, streaming: true, hasApiKey: false, systemPromptStyle: "system" };
   config.models.exposed = ["mock-llm-small", "mock-llm-large"];
   config.streaming.batchMs = 100;
   worker = await startWorker({ config, store, provider: buildProvider(config, store), log: silentLogger, writeStatus: false });
@@ -184,4 +185,77 @@ describe("static web client", () => {
     expect(overflow).toBe(false);
     await ctx.close();
   });
+
+  it("sends each conversation's own system prompt, editable mid-conversation, and keeps it across reloads", async () => {
+    const translator = TEMPLATES[0]!;
+    const lastSent = () => provider.chats.at(-1)!.body.messages as { role: string; content: string }[];
+    const chip = page.locator(".system-chip");
+
+    // Conversation 1: a starter template chosen in the new-chat advanced settings.
+    await page.getByRole("button", { name: "New chat" }).click();
+    await page.getByText("Advanced settings").click();
+    await page.getByLabel("Insert a prompt…").selectOption({ label: translator.name });
+    await expect(page.getByLabel("System prompt", { exact: true }).inputValue()).resolves.toBe(translator.content);
+    await sendAndWait(page, "good morning");
+    expect(lastSent()).toEqual([
+      { role: "system", content: translator.content },
+      { role: "user", content: "good morning" },
+    ]);
+    await expect(chip.textContent()).resolves.toContain(translator.name);
+
+    // Conversation 2: a custom prompt typed in, isolated from conversation 1.
+    await page.getByRole("button", { name: "New chat" }).click();
+    await expect(page.locator(".msg").count()).resolves.toBe(0);
+    await page.getByText("Advanced settings").click();
+    await expect(page.getByLabel("System prompt", { exact: true }).inputValue()).resolves.toBe(""); // not carried over
+    await page.getByLabel("System prompt", { exact: true }).fill("You are a pirate.");
+    await sendAndWait(page, "ahoy");
+    expect(lastSent()).toEqual([
+      { role: "system", content: "You are a pirate." },
+      { role: "user", content: "ahoy" },
+    ]);
+
+    // Edit it mid-conversation: the next request uses the new prompt, history is unchanged.
+    await page.getByRole("button", { name: "System prompt", exact: true }).click();
+    const dialog = page.getByRole("dialog");
+    await dialog.getByLabel("System prompt", { exact: true }).fill("You are a pirate captain.");
+    await dialog.getByRole("button", { name: "Save", exact: true }).click();
+    await sendAndWait(page, "next");
+    expect(lastSent()).toEqual([
+      { role: "system", content: "You are a pirate captain." },
+      { role: "user", content: "ahoy" },
+      { role: "assistant", content: "You said: ahoy" },
+      { role: "user", content: "next" },
+    ]);
+    expect(await page.locator(".msg.user .bubble").allTextContents()).toEqual(["ahoy", "next"]);
+
+    // Back in conversation 1, its own prompt is still used.
+    await page.locator(".conv-title", { hasText: "good morning" }).click();
+    await expect(chip.textContent()).resolves.toContain(translator.name);
+    await sendAndWait(page, "thank you");
+    expect(lastSent()[0]).toEqual({ role: "system", content: translator.content });
+    expect(JSON.stringify(lastSent())).not.toContain("pirate");
+
+    // Used prompts show up in the library (templates aren't duplicated there).
+    await page.getByRole("button", { name: "Settings" }).click();
+    await page.getByRole("button", { name: "Manage…" }).click();
+    const lib = page.getByRole("dialog", { name: "System prompts" });
+    await expect(lib.locator(".prompt-row summary").allTextContents()).resolves.toEqual(
+      expect.arrayContaining([expect.stringContaining("You are a pirate captain."), expect.stringContaining("You are a pirate.")]),
+    );
+    // Make the pirate captain prompt the default for new chats.
+    await lib.getByLabel("Change…").selectOption({ label: "You are a pirate captain." });
+    await lib.getByRole("button", { name: "Close" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Close" }).click();
+    await page.getByRole("button", { name: "New chat" }).click();
+    await expect(page.locator(".advanced summary").textContent()).resolves.toContain("System prompt: You are a pirate captain.");
+
+    // Persisted (encrypted) across a reload.
+    await page.reload();
+    await page.getByLabel("Password").fill(PASSWORD);
+    await page.getByRole("button", { name: "Unlock" }).click();
+    await page.locator(".conv-title", { hasText: "ahoy" }).click();
+    await expect(chip.textContent()).resolves.toContain("You are a pirate captain.");
+    expect(await page.evaluate(() => localStorage.getItem("relayllm.prefs.v1") ?? "")).not.toContain("pirate");
+  }, 60_000);
 });

@@ -1,21 +1,27 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { parsePairingUrl, type ChatHandle, type PairingInfo } from "@relayllm/nostr-transport";
 import { ERROR_TEXT, newId, type ErrorCode } from "@relayllm/protocol";
 import { ChatView } from "./components/ChatView.tsx";
 import { AddWorkerDialog, SettingsDialog, type ThemePref } from "./components/Dialogs.tsx";
 import { Onboarding } from "./components/Onboarding.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
+import { PromptLibraryDialog, SystemPromptDialog, SystemPromptEditor } from "./components/SystemPrompt.tsx";
 import { ConnectionManager, type ConnectionState } from "./lib/connection.ts";
 import { buildContext, titleFrom } from "./lib/context.ts";
 import { LocalDB, type ChatMessageRecord, type Conversation, type WorkerProfile } from "./lib/db.ts";
 import { forgetIdentity, loadStoredIdentity, type UnlockedIdentity } from "./lib/identity.ts";
+import { autoName, DEFAULT_MAX_PROMPT_CHARS, describePrompt, MAX_LIBRARY, rememberPrompt, sortLibrary, type SavedPrompt } from "./lib/prompts.ts";
 
 // ---------------------------------------------------------------- prefs (non-secret)
 
 interface Prefs {
   theme: ThemePref;
   lastWorker?: string;
-  systemPrompt: string;
+  /**
+   * Legacy: older versions kept one global system prompt here, in plaintext.
+   * It is kept only until it has been moved into the encrypted store.
+   */
+  systemPrompt?: string;
 }
 const PREFS_KEY = "relayllm.prefs.v1";
 function loadPrefs(): Prefs {
@@ -24,12 +30,13 @@ function loadPrefs(): Prefs {
     return {
       theme: p.theme === "light" || p.theme === "dark" ? p.theme : "system",
       lastWorker: typeof p.lastWorker === "string" ? p.lastWorker : undefined,
-      systemPrompt: typeof p.systemPrompt === "string" ? p.systemPrompt.slice(0, 4000) : "",
+      systemPrompt: typeof p.systemPrompt === "string" && p.systemPrompt.trim() ? p.systemPrompt.trim() : undefined,
     };
   } catch {
-    return { theme: "system", systemPrompt: "" };
+    return { theme: "system" };
   }
 }
+
 
 // ---------------------------------------------------------------- pairing link
 
@@ -119,6 +126,12 @@ function Main({
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [library, setLibrary] = useState<SavedPrompt[]>([]);
+  const [defaultPrompt, setDefaultPrompt] = useState("");
+  /** System prompt for the next new conversation (advanced settings). */
+  const [draftPrompt, setDraftPrompt] = useState("");
+  const [editingPrompt, setEditingPrompt] = useState(false);
+  const [showLibrary, setShowLibrary] = useState(false);
   const handles = useRef(new Map<string, ChatHandle>());
   const [streamingIds, setStreamingIds] = useState<Set<string>>(new Set());
   const saveTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
@@ -131,8 +144,35 @@ function Main({
       convsRef.current = cs;
       setConversations(cs);
       setActiveWorkerId((cur) => (cur && ws.some((w) => w.id === cur) ? cur : (ws[0]?.id ?? null)));
+
+      const [lib, settings] = await Promise.all([db.listPrompts(), db.getSettings()]);
+      let def = settings.defaultPrompt ?? "";
+      const legacy = prefs.systemPrompt;
+      if (legacy) {
+        // One-time move of the old global prompt into the encrypted store.
+        const saved = rememberPrompt(lib, legacy);
+        if (saved) {
+          saved.name = "My default prompt";
+          delete saved.lastUsedAt;
+          await db.savePrompt(saved);
+          lib.push(saved);
+        }
+        if (!def) {
+          def = legacy;
+          await db.saveSettings({ ...settings, defaultPrompt: def });
+        }
+      }
+      setLibrary(lib);
+      setDefaultPrompt(def);
+      if (legacy) setPrefs(({ systemPrompt: _, ...rest }) => rest);
     })();
+    // Runs once per unlocked database.
   }, [db]);
+
+  // A new chat starts from the default prompt (before paint, so the previous draft never flashes).
+  useLayoutEffect(() => {
+    if (!activeConvId) setDraftPrompt(defaultPrompt);
+  }, [activeConvId, defaultPrompt]);
 
   const worker = workers.find((w) => w.id === activeWorkerId) ?? null;
   const conversation = conversations.find((c) => c.id === activeConvId) ?? null;
@@ -205,13 +245,60 @@ function Main({
     [commit],
   );
 
+  // ---------------- system prompts
+
+  const savePromptEntry = useCallback(
+    (p: SavedPrompt) => {
+      setLibrary((lib) => {
+        let next = [...lib.filter((x) => x.id !== p.id), p];
+        if (next.length > MAX_LIBRARY) {
+          const drop = sortLibrary(next).slice(MAX_LIBRARY);
+          for (const d of drop) void db.deletePrompt(d.id);
+          next = next.filter((x) => !drop.includes(x));
+        }
+        return next;
+      });
+      void db.savePrompt(p);
+    },
+    [db],
+  );
+
+  const notePromptUsed = useCallback(
+    (content: string | undefined) => {
+      const entry = content ? rememberPrompt(library, content) : null;
+      if (entry) savePromptEntry(entry);
+    },
+    [library, savePromptEntry],
+  );
+
+  const setDefault = (content: string) => {
+    const def = content.trim();
+    setDefaultPrompt(def);
+    void db.getSettings().then((s) => db.saveSettings({ ...s, defaultPrompt: def || undefined }));
+  };
+
+  const saveToLibrary = (content: string) => {
+    const entry = rememberPrompt(library, content);
+    if (entry) savePromptEntry({ ...entry, lastUsedAt: undefined });
+  };
+
+  const setConversationPrompt = (convId: string, content: string) => {
+    const systemPrompt = content.trim() ? content : undefined;
+    commit(convsRef.current.map((c) => (c.id === convId ? { ...c, systemPrompt } : c)));
+    persist(convId, true);
+    notePromptUsed(systemPrompt);
+  };
+
+  const maxPromptChars = connState?.limits?.maxSystemPromptChars ?? DEFAULT_MAX_PROMPT_CHARS;
+
   // ---------------- chat
 
   const runCompletion = useCallback(
     async (base: Conversation) => {
       if (!worker || !connState) return;
       const conn = conns.get(worker);
-      const ctx = buildContext(base.messages, connState.limits, prefs.systemPrompt);
+      // The conversation's own prompt, as it is now: edits apply from the next request on.
+      const ctx = buildContext(base.messages, connState.limits, base.systemPrompt);
       const asst: ChatMessageRecord = {
         id: newId(),
         role: "assistant",
@@ -225,6 +312,15 @@ function Main({
       upsert(conv);
       setActiveConvId(conv.id);
       persist(conv.id, true);
+      const promptLimit = connState.limits?.maxSystemPromptChars;
+      if (promptLimit !== undefined && (base.systemPrompt?.trim().length ?? 0) > promptLimit) {
+        patchMessage(conv.id, asst.id, {
+          status: "error",
+          error: `The system prompt is longer than this worker allows (${promptLimit.toLocaleString()} characters). Edit it and try again.`,
+        });
+        persist(conv.id, true);
+        return;
+      }
       if (ctx.tooLarge) {
         patchMessage(conv.id, asst.id, {
           status: "error",
@@ -266,7 +362,7 @@ function Main({
         persist(conv.id, true);
       }
     },
-    [worker, connState, conns, model, prefs.systemPrompt, upsert, persist, patchMessage],
+    [worker, connState, conns, model, upsert, persist, patchMessage],
   );
 
   const send = (text: string) => {
@@ -276,7 +372,17 @@ function Main({
     const base: Conversation =
       conversation && conversation.workerId === worker.id
         ? { ...conversation, messages: [...conversation.messages, user] }
-        : { id: newId(), title: titleFrom(text), workerId: worker.id, model, createdAt: now, updatedAt: now, messages: [user] };
+        : {
+            id: newId(),
+            title: titleFrom(text),
+            workerId: worker.id,
+            model,
+            createdAt: now,
+            updatedAt: now,
+            messages: [user],
+            systemPrompt: draftPrompt.trim() ? draftPrompt : undefined,
+          };
+    if (base.messages.length === 1) notePromptUsed(base.systemPrompt);
     if (worker.lastModel !== model) {
       const w = { ...worker, lastModel: model };
       setWorkers((ws) => ws.map((x) => (x.id === w.id ? w : x)));
@@ -384,7 +490,36 @@ function Main({
         onRefresh={() => worker && void conns.get(worker).refresh()}
         onRequestAccess={() => worker && void conns.get(worker).requestAccess(undefined, "web client")}
         onToggleSidebar={() => setSidebarOpen((o) => !o)}
+        systemPromptName={conversation?.systemPrompt ? describePrompt(conversation.systemPrompt, library) : undefined}
+        draftPromptName={draftPrompt.trim() ? describePrompt(draftPrompt, library) : undefined}
+        onEditPrompt={() => setEditingPrompt(true)}
+        newChatAdvanced={
+          <SystemPromptEditor
+            value={draftPrompt}
+            onChange={setDraftPrompt}
+            library={library}
+            defaultPrompt={defaultPrompt}
+            maxChars={maxPromptChars}
+            onSaveToLibrary={saveToLibrary}
+            onManage={() => setShowLibrary(true)}
+          />
+        }
       />
+      {editingPrompt && conversation && (
+        <SystemPromptDialog
+          initial={conversation.systemPrompt ?? ""}
+          library={library}
+          defaultPrompt={defaultPrompt}
+          maxChars={maxPromptChars}
+          onSaveToLibrary={saveToLibrary}
+          onManage={() => setShowLibrary(true)}
+          onSave={(v) => {
+            setConversationPrompt(conversation.id, v);
+            setEditingPrompt(false);
+          }}
+          onClose={() => setEditingPrompt(false)}
+        />
+      )}
       {(showAdd || pairing) && (
         <AddWorkerDialog
           initial={pairing ?? undefined}
@@ -400,9 +535,9 @@ function Main({
           identity={identity.stored}
           workers={workers}
           theme={prefs.theme}
-          systemPrompt={prefs.systemPrompt}
+          defaultPromptName={describePrompt(defaultPrompt, library)}
           onTheme={(theme) => setPrefs((p) => ({ ...p, theme }))}
-          onSystemPrompt={(systemPrompt) => setPrefs((p) => ({ ...p, systemPrompt }))}
+          onManagePrompts={() => setShowLibrary(true)}
           onRenameWorker={(w, name) => {
             const nw = { ...w, name };
             setWorkers((ws) => ws.map((x) => (x.id === w.id ? nw : x)));
@@ -425,6 +560,30 @@ function Main({
           onLock={onLock}
           onForget={onForget}
           onClose={() => setShowSettings(false)}
+        />
+      )}
+      {showLibrary && (
+        <PromptLibraryDialog
+          library={library}
+          defaultPrompt={defaultPrompt}
+          onDefault={setDefault}
+          onSave={savePromptEntry}
+          onCreate={() => {
+            const now = Date.now();
+            const p: SavedPrompt = { id: newId(), name: autoName(""), content: "", createdAt: now, updatedAt: now };
+            setLibrary((lib) => [...lib, p]);
+            return p;
+          }}
+          onDelete={(p) => {
+            if (p.content.trim() && !confirm(`Delete “${p.name}” from your prompts? Conversations that used it keep their copy.`)) return;
+            setLibrary((lib) => lib.filter((x) => x.id !== p.id));
+            void db.deletePrompt(p.id);
+          }}
+          onClose={() => {
+            // Drop "New prompt" entries that were never filled in (never saved to the DB).
+            setLibrary((lib) => lib.filter((x) => x.content.trim()));
+            setShowLibrary(false);
+          }}
         />
       )}
     </div>

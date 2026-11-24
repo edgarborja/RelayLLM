@@ -107,9 +107,9 @@ export function SettingsDialog(props: {
   identity: StoredIdentity;
   workers: WorkerProfile[];
   theme: ThemePref;
-  systemPrompt: string;
+  defaultPromptName: string;
   onTheme: (t: ThemePref) => void;
-  onSystemPrompt: (s: string) => void;
+  onManagePrompts: () => void;
   onRenameWorker: (w: WorkerProfile, name: string) => void;
   onRemoveWorker: (w: WorkerProfile) => void;
   onDeleteHistory: () => void;
@@ -121,7 +121,6 @@ export function SettingsDialog(props: {
   const [revealPw, setRevealPw] = useState("");
   const [nsec, setNsec] = useState<string | null>(null);
   const [revealErr, setRevealErr] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState(props.systemPrompt);
 
   return (
     <Modal title="Settings" onClose={props.onClose}>
@@ -188,14 +187,16 @@ export function SettingsDialog(props: {
         </section>
 
         <section>
-          <h3>System prompt</h3>
-          <textarea
-            rows={3}
-            placeholder="Optional instructions sent at the start of every conversation"
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onBlur={() => props.onSystemPrompt(prompt)}
-          />
+          <h3>System prompts</h3>
+          <div className="row">
+            <span className="small">
+              Default for new chats: <strong>{props.defaultPromptName}</strong>
+            </span>
+            <div className="spacer" />
+            <button className="btn small" onClick={props.onManagePrompts}>
+              Manage…
+            </button>
+          </div>
         </section>
 
         <section>

@@ -29,13 +29,29 @@ taken from a message field.
 | `chat.resume` | `target`, `missing?[seq]` or `fromSeq?` | re-sent `chat.delta`s and `chat.complete` if finished |
 | `pair.request` | `token?` (invite), `label?` | `pair.result {status: approved\|pending\|denied}` |
 
+### System prompts
+
+A conversation's system prompt travels inside `chat.start` as leading
+`role: "system"` messages. There is no separate operation. Rules enforced by the worker:
+
+* System messages may only come first. A system message after a user or
+  assistant message, or a request with no user/assistant message, gets
+  `invalid_request`.
+* Their combined length must not exceed `limits.maxSystemPromptChars`, which
+  `server.info.result` advertises. Otherwise the worker returns `too_large`.
+* The text only goes to the model. It can't change access, exposed models,
+  limits, provider settings or tools, and the client can't choose how the
+  engine receives it. That choice belongs to the worker owner: a leading
+  `system` or `developer` message, or text prepended to the first user message
+  (see [worker.md](worker.md#system-prompts)).
+
 ## Worker → client
 
 All carry `re`, the id of the request they answer.
 
 | type | fields |
 |---|---|
-| `server.info.result` | `name`, `software`, `versions`, `streaming{batchMs, resume}`, `limits{maxRequestBytes, maxResponseChars, maxMessages, requestTimeoutSec}` |
+| `server.info.result` | `name`, `software`, `versions`, `streaming{batchMs, resume}`, `limits{maxRequestBytes, maxResponseChars, maxMessages, requestTimeoutSec, maxSystemPromptChars?}` |
 | `models.list.result` | `models[{id, contextLength?, streaming, cancel}]` (only models exposed to this user) |
 | `chat.ack` | `model` |
 | `chat.delta` | `seq` (0-based), `content?`, `reasoning?` |

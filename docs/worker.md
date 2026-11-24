@@ -59,6 +59,8 @@ No firewall rules, port forwarding or public IP are needed. The worker only make
 | Relays | `relayllm relays`, `relayllm relays add wss://…`, `relayllm relays remove wss://…` |
 | Change engine | `relayllm provider set --kind ollama --url http://localhost:11434/v1` |
 | Engine API key | `relayllm provider set --api-key` (hidden prompt) |
+| How system prompts reach the engine | `relayllm provider set --system-style system\|developer\|user-prefix` |
+| …for one model only | `relayllm models system-style <id> user-prefix` (`default` to reset) |
 | Web client URL for links | `relayllm client-url https://you.github.io/relayllm/` |
 | Show worker npub | `relayllm identity` |
 | New worker identity | `relayllm identity rotate` |
@@ -83,10 +85,25 @@ User, model and access changes apply to a running worker within about 2 seconds.
   "maxRequestBytes": 400000,     // conversation context per request
   "maxMessages": 200,
   "maxResponseChars": 200000,
-  "maxTokens": 8192              // cap (and default) for max_tokens
+  "maxTokens": 8192,             // cap (and default) for max_tokens
+  "maxSystemPromptChars": 32000  // total length of a conversation's system prompt
 },
 "streaming": { "batchMs": 250, "maxBatchChars": 4000, "resumeBufferSec": 180 }
 ```
+
+## System prompts
+
+Users can give each conversation a system prompt in the web client. It arrives as the first message of each chat request. It only instructs the model; access, exposed models, limits and provider settings always come from this worker's config.
+
+Engines differ in how they accept system instructions, so you choose the convention. The client can't:
+
+| Style | Sent to the engine as | Use for |
+|---|---|---|
+| `system` (default) | a leading `{"role": "system"}` message | LM Studio / Bionic, Ollama, vLLM, most models |
+| `developer` | a leading `{"role": "developer"}` message | servers that follow OpenAI's newer convention |
+| `user-prefix` | text prepended to the first user message | chat templates that reject the system role (some Gemma/Mistral builds return HTTP 400) |
+
+Set it for the whole engine with `relayllm provider set --system-style …` (restart needed), or per model with `relayllm models system-style <id> …` (applies within a few seconds).
 
 ## Run in the background
 

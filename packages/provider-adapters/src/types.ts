@@ -1,3 +1,5 @@
+import type { SystemPromptStyle } from "./system-prompt.ts";
+
 /**
  * Provider abstraction. The Nostr gateway only ever talks to providers through
  * this interface; adapters never receive raw client payloads, only the
@@ -18,10 +20,16 @@ export interface ProviderModel {
 
 export interface ChatRequest {
   model: string;
+  /** System messages, if any, come first (the worker enforces this). */
   messages: { role: "system" | "user" | "assistant"; content: string }[];
   temperature?: number;
   top_p?: number;
   max_tokens?: number;
+  /**
+   * How to deliver the system instructions to this engine/model. Chosen by
+   * the worker's own config, never by the client. Defaults to the adapter's.
+   */
+  systemPromptStyle?: SystemPromptStyle;
 }
 
 export type ChatChunk =

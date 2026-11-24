@@ -8,7 +8,15 @@ import * as nip19 from "nostr-tools/nip19";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import qrcode from "qrcode-terminal";
 import { buildPairingUrl, hexToNpub, normalizeRelayUrl, npubToHex } from "@relayllm/nostr-transport";
-import { checkProviderEndpoint, createProvider, PROVIDER_DEFAULTS, type ProviderKind, type ProviderModel } from "@relayllm/provider-adapters";
+import {
+  checkProviderEndpoint,
+  createProvider,
+  PROVIDER_DEFAULTS,
+  SYSTEM_PROMPT_STYLES,
+  type ProviderKind,
+  type ProviderModel,
+  type SystemPromptStyle,
+} from "@relayllm/provider-adapters";
 import { addUser, createInvite, removeUser } from "./access.ts";
 import {
   configExists,
@@ -49,6 +57,8 @@ Models
   relayllm models enable <id>...      Expose models to authorized users
   relayllm models disable <id>...     Stop exposing models
   relayllm models add <id>            Add a model that discovery does not report
+  relayllm models system-style <id> system|developer|user-prefix|default
+                                      How system prompts reach this model
 
 Users
   relayllm users                      List authorized users and pending requests
@@ -61,6 +71,7 @@ Configuration
   relayllm relays [add|remove <url>]  List or change Nostr relays
   relayllm provider                   Show provider configuration
   relayllm provider set [--kind K] [--url URL] [--api-key] [--no-api-key] [--allow-remote]
+                       [--system-style system|developer|user-prefix]
   relayllm client-url <url>           Set the web client URL used in pairing links
   relayllm identity                   Show the worker npub
   relayllm identity rotate            Generate a new worker identity (re-pair all devices)
@@ -247,7 +258,7 @@ async function cmdInit(args: string[]): Promise<void> {
   }
   baseUrl = check.url!.toString();
   const needKey = /^y/i.test(await ask("Does the engine require an API key? (y/N)", cfg.provider.hasApiKey ? "y" : "n"));
-  cfg.provider = { kind, baseUrl, allowRemoteEndpoint: allowRemote, streaming: true, hasApiKey: needKey };
+  cfg.provider = { ...cfg.provider, kind, baseUrl, allowRemoteEndpoint: allowRemote, streaming: true, hasApiKey: needKey };
 
   out("\nStep 3/7 — Secret storage");
   const keychainOk = KeychainStore.available();
@@ -428,12 +439,26 @@ async function cmdModels(args: string[]): Promise<void> {
     if (!all.size) out("No models found.");
     for (const m of all.values()) {
       const on = cfg.models.exposed.includes(m.id);
-      const flags = [m.type, m.contextLength ? `ctx ${m.contextLength}` : "", !m.chat ? "not chat-capable" : "", !models.some((x) => x.id === m.id) ? "manual/not discovered" : ""]
+      const style = cfg.models.systemPromptStyle[m.id];
+      const flags = [m.type, m.contextLength ? `ctx ${m.contextLength}` : "", style ? `system prompt: ${style}` : "", !m.chat ? "not chat-capable" : "", !models.some((x) => x.id === m.id) ? "manual/not discovered" : ""]
         .filter(Boolean)
         .join(", ");
       out(`${on ? "[x]" : "[ ]"} ${m.id}${flags ? `  (${flags})` : ""}`);
     }
     out('\nEnable with "relayllm models enable <id>", disable with "relayllm models disable <id>".');
+    return;
+  }
+  if (sub === "system-style") {
+    const [id, style] = ids;
+    const styles: readonly string[] = SYSTEM_PROMPT_STYLES;
+    if (!id || !style || (style !== "default" && !styles.includes(style))) {
+      fail(`usage: relayllm models system-style <id> ${SYSTEM_PROMPT_STYLES.join("|")}|default`);
+    }
+    updateConfig((c) => {
+      if (style === "default") delete c.models.systemPromptStyle[id];
+      else c.models.systemPromptStyle[id] = style as SystemPromptStyle;
+    }, home);
+    out(`System prompts for ${id}: ${style === "default" ? "provider default" : style}. A running worker picks this up within a few seconds.`);
     return;
   }
   if (!ids.length) fail(`usage: relayllm models ${sub} <id>...`);
@@ -529,6 +554,7 @@ async function cmdProvider(args: string[]): Promise<void> {
     out(`api key:    ${cfg.provider.hasApiKey ? `stored in ${cfg.keyStorage}` : "none"}`);
     out(`streaming:  ${cfg.provider.streaming}`);
     out(`remote ok:  ${cfg.provider.allowRemoteEndpoint}`);
+    out(`system:     ${cfg.provider.systemPromptStyle}`);
     return;
   }
   if (sub !== "set") fail(`unknown subcommand "${sub}"`);
@@ -541,6 +567,7 @@ async function cmdProvider(args: string[]): Promise<void> {
       "no-api-key": { type: "boolean" },
       "allow-remote": { type: "boolean" },
       "no-streaming": { type: "boolean" },
+      "system-style": { type: "string" },
     },
   });
   const cfg = loadConfig(home);
@@ -555,6 +582,11 @@ async function cmdProvider(args: string[]): Promise<void> {
     cfg.provider.baseUrl = c.url!.toString();
   }
   if (values["no-streaming"]) cfg.provider.streaming = false;
+  if (values["system-style"]) {
+    const styles: readonly string[] = SYSTEM_PROMPT_STYLES;
+    if (!styles.includes(values["system-style"])) fail(`--system-style must be one of ${SYSTEM_PROMPT_STYLES.join(", ")}`);
+    cfg.provider.systemPromptStyle = values["system-style"] as SystemPromptStyle;
+  }
   if (values["api-key"]) {
     const k = await askSecret("API key (input hidden): ");
     if (!k) fail("empty key");

@@ -7,6 +7,7 @@ import {
   OllamaProvider,
   OpenAICompatibleProvider,
   ProviderError,
+  applySystemPromptStyle,
   type ChatChunk,
 } from "../src/index.ts";
 
@@ -196,5 +197,50 @@ describe("vLLM / generic adapters", () => {
     expect((await p.health()).ok).toBe(false);
     const err = await collect(p.chat({ model: "m", messages: [{ role: "user", content: "x" }] }, new AbortController().signal)).catch((e) => e);
     expect(err.code).toBe("unavailable");
+  });
+});
+
+describe("system prompt conventions", () => {
+  const msgs = [
+    { role: "system" as const, content: "Rule A." },
+    { role: "system" as const, content: "Rule B." },
+    { role: "user" as const, content: "hi" },
+    { role: "assistant" as const, content: "hello" },
+    { role: "user" as const, content: "bye" },
+  ];
+
+  it("merges leading system messages and rewrites them per style", () => {
+    expect(applySystemPromptStyle(msgs, "system").slice(0, 2)).toEqual([
+      { role: "system", content: "Rule A.\n\nRule B." },
+      { role: "user", content: "hi" },
+    ]);
+    expect(applySystemPromptStyle(msgs, "developer")[0]).toEqual({ role: "developer", content: "Rule A.\n\nRule B." });
+    expect(applySystemPromptStyle(msgs, "user-prefix")).toEqual([
+      { role: "user", content: "Rule A.\n\nRule B.\n\nhi" },
+      { role: "assistant", content: "hello" },
+      { role: "user", content: "bye" },
+    ]);
+    // No system prompt: untouched, whatever the style.
+    expect(applySystemPromptStyle(msgs.slice(2), "user-prefix")).toEqual(msgs.slice(2));
+    // Blank system prompt is dropped.
+    expect(applySystemPromptStyle([{ role: "system", content: "  " }, ...msgs.slice(2)], "system")).toEqual(msgs.slice(2));
+  });
+
+  it("sends the configured convention, overridable per request by the worker", async () => {
+    const bodies: { messages: { role: string; content: string }[] }[] = [];
+    const { fn } = fakeFetch({
+      "/v1/chat/completions": (init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return sse([{ choices: [{ delta: { content: "ok" } }] }, "[DONE]"]);
+      },
+    });
+    const p = createProvider("ollama", { baseUrl: "http://127.0.0.1:11434/v1", fetchImpl: fn, systemPromptStyle: "user-prefix" });
+    await collect(p.chat({ model: "gemma", messages: msgs.slice(1, 3) }, new AbortController().signal));
+    await collect(p.chat({ model: "llama", messages: msgs.slice(1, 3), systemPromptStyle: "system" }, new AbortController().signal));
+    expect(bodies[0]!.messages).toEqual([{ role: "user", content: "Rule B.\n\nhi" }]);
+    expect(bodies[1]!.messages).toEqual([
+      { role: "system", content: "Rule B." },
+      { role: "user", content: "hi" },
+    ]);
   });
 });
