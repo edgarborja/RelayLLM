@@ -1,0 +1,32 @@
+{
+  "name": "@relayllm/api",
+  "version": "0.1.0",
+  "description": "Call a RelayLLM worker from programs and scripts over encrypted Nostr messages",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "relayllm-api": "./dist/cli.mjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "@relayllm/nostr-transport": "workspace:*",
+    "@relayllm/protocol": "workspace:*",
+    "@relayllm/test-utils": "workspace:*",
+    "ajv": "^8.17.1",
+    "nostr-tools": "^2.26.1"
+  }
+}

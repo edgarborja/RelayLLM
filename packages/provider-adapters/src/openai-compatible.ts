@@ -243,7 +243,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
   }
 
   protected async *generate(req: ChatRequest, signal: AbortSignal): AsyncGenerator<InferenceEvent> {
-    // Allowlisted body: no tools, functions, response_format, logit_bias, etc.
+    // Allowlisted body: no tools, functions, logit_bias, etc.
     const body: Record<string, unknown> = {
       model: req.model,
       messages: applySystemPromptStyle(req.messages, req.systemPromptStyle ?? this.systemPromptStyle),
@@ -252,6 +252,7 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     if (req.temperature !== undefined) body.temperature = req.temperature;
     if (req.top_p !== undefined) body.top_p = req.top_p;
     if (req.max_tokens !== undefined) body.max_tokens = req.max_tokens;
+    if (req.jsonSchema) body.response_format = { type: "json_schema", json_schema: { name: "output", strict: true, schema: req.jsonSchema } };
     if (this.streaming) body.stream_options = { include_usage: true };
     if (req.reasoning) this.applyReasoning(body, req.reasoning, req.reasoningMode);
 
@@ -455,6 +456,7 @@ export class OllamaProvider extends OpenAICompatibleProvider {
       stream: this.streaming,
       options,
     };
+    if (req.jsonSchema) body.format = req.jsonSchema;
     if (req.reasoning) body.think = req.reasoning === "off" ? false : req.reasoning === "on" ? true : req.reasoning;
 
     let res: Response;

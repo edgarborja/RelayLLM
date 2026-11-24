@@ -42,6 +42,7 @@ See [docs/deploy-github-pages.md](docs/deploy-github-pages.md). In short: push t
 * Per-conversation system prompts. Set one under **Advanced settings** in a new chat, or start from a template (Spanish ⇄ English translator, American War of Independence fiction writer, sponsor–child correspondence reviewer). Edit it mid-conversation with the sliders button; used prompts are kept in an encrypted library, and a default can be set for new chats.
 * A context indicator next to the model selector shows how much of the model's loaded context window the conversation uses. Click it for model details (maximum vs. loaded context, load state, memory), the latest generation speed, and, if the worker owner enables `relayllm monitoring on`, the machine's RAM, swap and memory pressure.
 * Local-only history in IndexedDB, encrypted at rest. Identities are protected with NIP-49 or kept in a NIP-07 extension.
+* A command and Node library, `relayllm-api`, for calling the worker from scripts, with JSON output that follows a schema and resumable batches.
 * No telemetry and no RelayLLM account or server.
 
 ## Documentation
@@ -50,6 +51,7 @@ See [docs/deploy-github-pages.md](docs/deploy-github-pages.md). In short: push t
 |---|---|
 | [docs/worker.md](docs/worker.md) | Worker installation, CLI, Bionic/Ollama notes, background service, limits |
 | [docs/deploy-github-pages.md](docs/deploy-github-pages.md) | Hosting the client |
+| [docs/api.md](docs/api.md) | Calling a worker from programs and scripts, JSON output |
 | [docs/reasoning.md](docs/reasoning.md) | Reasoning control, timeouts, cancellation, live statistics |
 | [docs/architecture.md](docs/architecture.md) | Design, transport choice (NIP-44, gift wrap, ContextVM, NIP-90), streaming |
 | [docs/protocol.md](docs/protocol.md) | Message schemas |
@@ -88,6 +90,7 @@ PROVIDER_URL=http://localhost:1235/v1 RELAY=wss://relay.k1.sv MODEL=qwen/qwen3.5
 
 ```
 apps/client               React + Vite static web app
+apps/api                  relayllm-api command and Node library
 apps/worker               CLI, config, secrets, access control, gateway
 packages/protocol         message schemas and validation
 packages/nostr-transport  encryption, relay pool, fragmentation, pairing, WorkerClient

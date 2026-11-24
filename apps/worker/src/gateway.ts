@@ -2,6 +2,7 @@ import {
   envelope,
   ERROR_TEXT,
   parseClientMessage,
+  schemaProblem,
   SUPPORTED_VERSIONS,
   type ClientMessage,
   type ClientMessageOf,
@@ -223,6 +224,7 @@ export class Gateway {
             heartbeatSec: cfg.limits.heartbeatSec,
             inactivityTimeoutSec: cfg.limits.inactivityTimeoutSec,
             maxTokens: cfg.limits.maxTokens,
+            maxSchemaChars: cfg.limits.maxSchemaChars || undefined,
           },
         });
       case "models.list":
@@ -399,9 +401,25 @@ export class Gateway {
       return this.#error(replyTo, "too_large", m.id, { message: "The system prompt is longer than this worker allows." });
     }
 
-    const wanted = m.params?.reasoning;
-    if (wanted && !(await this.reasoningOptions(m.model)).includes(wanted)) {
-      return this.#error(replyTo, "invalid_request", m.id, { message: "This model doesn't support that reasoning setting." });
+    const schema = m.params?.responseFormat?.schema;
+    if (schema) {
+      const problem = cfg.limits.maxSchemaChars ? schemaProblem(schema, cfg.limits.maxSchemaChars) : "This worker doesn't offer structured output.";
+      if (problem) return this.#error(replyTo, "invalid_request", m.id, { message: problem });
+    }
+    let reasoning = m.params?.reasoning;
+    if (reasoning || schema) {
+      const options = await this.reasoningOptions(m.model);
+      if (reasoning && !options.includes(reasoning)) {
+        return this.#error(replyTo, "invalid_request", m.id, { message: "This model doesn't support that reasoning setting." });
+      }
+      // With thinking on, Bionic applies the schema to the thinking and leaves
+      // the answer empty. Structured output therefore runs with it off.
+      if (schema && options.includes("off")) {
+        if (reasoning && reasoning !== "off") {
+          return this.#error(replyTo, "invalid_request", m.id, { message: "Structured output needs reasoning off for this model." });
+        }
+        reasoning = "off";
+      }
     }
     // A duplicate of this start may have been accepted while we waited.
     if (this.#streams.has(m.id)) return;
@@ -500,7 +518,8 @@ export class Gateway {
         top_p: m.params?.top_p,
         max_tokens: budget,
         systemPromptStyle: cfg.models.systemPromptStyle[m.model] ?? cfg.provider.systemPromptStyle,
-        reasoning: m.params?.reasoning,
+        reasoning,
+        jsonSchema: schema,
         reasoningMode: cfg.models.reasoning[m.model],
       };
       inferenceStart = mono();

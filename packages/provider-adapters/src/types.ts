@@ -34,6 +34,8 @@ export interface ChatRequest {
   systemPromptStyle?: SystemPromptStyle;
   /** Omitted = the model's default ("auto"). Validated by the worker. */
   reasoning?: ReasoningSetting;
+  /** Constrain the answer to this JSON schema. Validated by the worker. */
+  jsonSchema?: Record<string, unknown>;
   /** Owner-declared control for engines that don't advertise one. */
   reasoningMode?: ReasoningMode;
 }

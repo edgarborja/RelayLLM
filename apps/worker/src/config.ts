@@ -71,6 +71,8 @@ export const ConfigSchema = z.object({
       maxTokens: z.number().int().min(1).default(DEFAULT_MAX_TOKENS),
       /** Total size of the client's system instructions. */
       maxSystemPromptChars: z.number().int().min(0).default(32_000),
+      /** Largest JSON schema a client may request output in (0 disables structured output). */
+      maxSchemaChars: z.number().int().min(0).default(16_000),
     })
     .prefault({}),
   monitoring: z

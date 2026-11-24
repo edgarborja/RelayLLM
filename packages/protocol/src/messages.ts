@@ -53,6 +53,42 @@ export type ChatMessage = z.infer<typeof ChatMessage>;
 export const ReasoningSetting = z.enum(["off", "on", "minimal", "low", "medium", "high", "xhigh"]);
 export type ReasoningSetting = z.infer<typeof ReasoningSetting>;
 
+/**
+ * Ask for output matching a JSON schema. Only send it to workers that report
+ * limits.maxSchemaChars; older ones reject the request.
+ */
+export const ResponseFormat = z.object({ type: z.literal("json_schema"), schema: z.record(z.string(), z.unknown()) }).strict();
+export type ResponseFormat = z.infer<typeof ResponseFormat>;
+
+const SCHEMA_MAX_DEPTH = 24;
+const SCHEMA_MAX_NODES = 2000;
+const SCHEMA_MAX_BOUND = 10_000;
+const BOUNDS = new Set(["minItems", "maxItems", "minLength", "maxLength", "minProperties", "maxProperties"]);
+
+/**
+ * Why a schema can't be passed to an engine, or null if it can. Engines compile
+ * schemas into grammars, so size, nesting and repetition are bounded, and
+ * references may only point inside the schema (nothing is ever fetched).
+ */
+export function schemaProblem(schema: unknown, maxChars: number): string | null {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return "The schema must be a JSON object.";
+  let nodes = 0;
+  const stack: { v: unknown; depth: number }[] = [{ v: schema, depth: 0 }];
+  while (stack.length) {
+    const { v, depth } = stack.pop()!;
+    if (++nodes > SCHEMA_MAX_NODES) return "The schema is too complex.";
+    if (!v || typeof v !== "object") continue;
+    if (depth > SCHEMA_MAX_DEPTH) return "The schema is nested too deeply.";
+    for (const [k, x] of Object.entries(v)) {
+      if (/^\$(ref|dynamicRef|recursiveRef)$/.test(k) && typeof x === "string" && !x.startsWith("#")) return "The schema may only reference itself (#…).";
+      if (BOUNDS.has(k) && typeof x === "number" && x > SCHEMA_MAX_BOUND) return `${k} may be at most ${SCHEMA_MAX_BOUND}.`;
+      stack.push({ v: x, depth: depth + 1 });
+    }
+  }
+  if (JSON.stringify(schema).length > maxChars) return `The schema is longer than ${maxChars} characters.`;
+  return null;
+}
+
 /** Generation parameters. Only these are ever forwarded to a provider. */
 export const ChatParams = z
   .object({
@@ -61,6 +97,7 @@ export const ChatParams = z
     max_tokens: z.number().int().min(1).max(1_000_000).optional(),
     /** Only send values the model lists in ModelInfo.reasoningOptions. */
     reasoning: ReasoningSetting.optional(),
+    responseFormat: ResponseFormat.optional(),
   })
   .strict();
 export type ChatParams = z.infer<typeof ChatParams>;
@@ -163,6 +200,8 @@ export const Limits = z.object({
   maxTokens: z.number().int().optional(),
   /** Max total length of leading system instructions (optional for older workers). */
   maxSystemPromptChars: z.number().int().optional(),
+  /** Largest JSON schema for params.responseFormat. Absent = not supported. */
+  maxSchemaChars: z.number().int().optional(),
 });
 export type Limits = z.infer<typeof Limits>;
 

@@ -516,6 +516,18 @@ describe("reasoning controls", () => {
   });
 });
 
+describe("structured output", () => {
+  const jsonSchema = { type: "object", properties: { a: { type: "string" } } };
+  it("maps the schema to each engine's own field", async () => {
+    const native = capture("/api/chat");
+    await collect(new OllamaProvider({ baseUrl: "http://localhost:11434/v1", fetchImpl: native.fn }).chat({ ...ask, jsonSchema }, signal()));
+    expect(native.bodies[0]!.format).toEqual(jsonSchema);
+    const compat = capture("/v1/chat/completions");
+    await collect(new VLLMProvider({ baseUrl: "http://localhost:8000/v1", fetchImpl: compat.fn }).chat({ ...ask, jsonSchema }, signal()));
+    expect(compat.bodies[0]!.response_format).toEqual({ type: "json_schema", json_schema: { name: "output", strict: true, schema: jsonSchema } });
+  });
+});
+
 describe("inference events", () => {
   const run = (events: unknown[]) => collect(createProvider("vllm", { baseUrl: "http://localhost:8000/v1", fetchImpl: fakeFetch({ "/v1/chat/completions": () => sse(events) }).fn }).chat(ask, signal()));
 

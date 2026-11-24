@@ -24,7 +24,7 @@ taken from a message field.
 |---|---|---|
 | `server.info` | – | `server.info.result` |
 | `models.list` | – | `models.list.result` |
-| `chat.start` | `model`, `messages[{role: system\|user\|assistant, content}]` (1–1000), `params?{temperature, top_p, max_tokens, reasoning}` | `chat.ack`, `chat.status`*, `chat.delta`*, `chat.complete` |
+| `chat.start` | `model`, `messages[{role: system\|user\|assistant, content}]` (1–1000), `params?{temperature, top_p, max_tokens, reasoning, responseFormat}` | `chat.ack`, `chat.status`*, `chat.delta`*, `chat.complete` |
 | `chat.cancel` | `target` (chat id) | `chat.cancel.result` (and the stream ends with `finishReason: "cancelled"`) |
 | `chat.resume` | `target`, `missing?[seq]` or `fromSeq?` | re-sent `chat.delta`s and `chat.complete` if finished |
 | `pair.request` | `token?` (invite), `label?` | `pair.result {status: approved\|pending\|denied}` |
@@ -46,13 +46,17 @@ A conversation's system prompt travels inside `chat.start` as leading
   `system` or `developer` message, or text prepended to the first user message
   (see [worker.md](worker.md#system-prompts)).
 
+### Structured output
+
+`params.responseFormat` is `{type: "json_schema", schema}`. Send it only to workers that report `limits.maxSchemaChars`; older ones reject the request. Schemas are bounded in size, nesting and repetition and may only reference themselves. If the model can switch reasoning off, the worker does, and refuses any other explicit setting. The answer arrives as ordinary text and the client must validate it.
+
 ## Worker → client
 
 All carry `re`, the id of the request they answer.
 
 | type | fields |
 |---|---|
-| `server.info.result` | `name`, `software`, `versions`, `streaming{batchMs, resume}`, `limits{maxRequestBytes, maxResponseChars, maxMessages, requestTimeoutSec, maxSystemPromptChars?, heartbeatSec?, inactivityTimeoutSec?, maxTokens?}` |
+| `server.info.result` | `name`, `software`, `versions`, `streaming{batchMs, resume}`, `limits{maxRequestBytes, maxResponseChars, maxMessages, requestTimeoutSec, maxSystemPromptChars?, heartbeatSec?, inactivityTimeoutSec?, maxTokens?, maxSchemaChars?}` |
 | `models.list.result` | `models[{id, contextLength?, streaming, cancel}]` (only models exposed to this user) |
 | `chat.ack` | `model` |
 | `chat.status` | `n` (increasing), `state` (loading\|prompt\|thinking\|answering\|finishing), `progress` (active\|quiet\|unknown), `elapsedMs`, `sinceProgressMs`, `deltaCount`, `reasoningTokens`, `answerTokens`, `tokensPerSecond` (nullable). On state changes (at most 1/s) and every `heartbeatSec`. |

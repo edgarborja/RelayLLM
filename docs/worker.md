@@ -92,7 +92,8 @@ User, model and access changes apply to a running worker within about 2 seconds.
   "maxMessages": 200,
   "maxResponseChars": 200000,
   "maxTokens": 16384,            // generation budget: reasoning + answer
-  "maxSystemPromptChars": 32000  // total length of a conversation's system prompt
+  "maxSystemPromptChars": 32000, // total length of a conversation's system prompt
+  "maxSchemaChars": 16000       // largest JSON schema for structured output; 0 disables it
 },
 "monitoring": { "host": false, "intervalSec": 10, "engineMetrics": false },
 "streaming": { "batchMs": 250, "maxBatchChars": 4000, "resumeBufferSec": 180 }

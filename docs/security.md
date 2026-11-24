@@ -21,9 +21,10 @@ The gateway is an inference gateway, not a proxy:
   * Ollama: `/api/tags`, `/api/version`, `/api/ps`, `POST /api/show` with an exposed model id, and `POST /api/chat` for inference.
   * vLLM: `/metrics`, only with `monitoring.engineMetrics`; only an allowlist of samples is parsed.
 * The provider base URL comes from local config only. By default it must be loopback. Redirects are refused.
-* Requests are rebuilt from allowlisted fields: `model`, `messages[role, content]`, `temperature`, `top_p`, `max_tokens`, `reasoning` (a fixed set, and only values the model supports). Tools, functions, `response_format`, extra roles and unknown fields are rejected by the schema.
+* Requests are rebuilt from allowlisted fields: `model`, `messages[role, content]`, `temperature`, `top_p`, `max_tokens`, `reasoning` (a fixed set, and only values the model supports), and `responseFormat` (a bounded JSON schema, see below). Tools, functions, extra roles and unknown fields are rejected by the schema.
 * A model must be explicitly exposed (`relayllm models enable`).
 * No shell, filesystem, model management, MCP, or agent features exist in the code.
+* JSON schemas for structured output are size-, depth- and repetition-limited, may not reference anything outside themselves, and are the only part of a request passed to the engine beyond messages and generation parameters. The engine compiles them, so this is some added attack surface; `maxSchemaChars: 0` turns it off.
 * System prompts are ordinary model input. They may only lead the conversation and are size-capped (`limits.maxSystemPromptChars`). They can't change access, models, limits or the provider. The worker owner chooses how they're delivered to the engine. A prompt can still steer the model's answers, as any user message can, so it is not a security boundary for what the model *says*.
 
 ## Metrics
