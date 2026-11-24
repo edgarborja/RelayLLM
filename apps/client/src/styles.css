@@ -1278,3 +1278,6 @@ a {
     max-width: 38vw;
   }
 }
+.auth-card .hint {
+  margin: -8px 0 0;
+}

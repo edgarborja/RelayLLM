@@ -331,4 +331,31 @@ describe("static web client", () => {
     config.monitoring.host = false;
     await ctx.close();
   }, 60_000);
+
+  it("explains the password requirements while creating an identity", async () => {
+    const ctx = await browser.newContext();
+    const p5 = await ctx.newPage();
+    await p5.goto(baseUrl);
+    await p5.getByRole("button", { name: "Create a new identity" }).click();
+    const create = p5.getByRole("button", { name: "Create identity" });
+    const pw = p5.getByLabel("Password (protects your key in this browser)");
+    await expect(p5.locator("#pw-hint").textContent()).resolves.toBe("At least 8 characters");
+    expect(await create.isDisabled()).toBe(true);
+    await expect(p5.getByText("Password needs at least 8 characters to continue.").count()).resolves.toBe(1);
+
+    await pw.fill("abcde");
+    await expect(p5.locator("#pw-hint").textContent()).resolves.toBe("At least 8 characters (3 more)");
+    await pw.fill("abcdefgh");
+    await expect(p5.locator("#pw-hint").textContent()).resolves.toBe("✓ At least 8 characters");
+    await expect(p5.getByText("Repeat the password to continue.").count()).resolves.toBe(1);
+
+    await p5.getByLabel("Repeat password").fill("abcdefgX");
+    await expect(p5.getByText("Passwords don’t match yet").count()).resolves.toBe(1);
+    await expect(p5.getByText("Make both passwords match to continue.").count()).resolves.toBe(1);
+    expect(await create.isDisabled()).toBe(true);
+    await p5.getByLabel("Repeat password").fill("abcdefgh");
+    expect(await create.isEnabled()).toBe(true);
+    await expect(p5.getByText("to continue.").count()).resolves.toBe(0);
+    await ctx.close();
+  });
 });

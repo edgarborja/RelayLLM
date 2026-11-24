@@ -120,8 +120,14 @@ export function Onboarding({
     );
   }
 
+  const MIN = 8;
+  const short = password.length < MIN;
+  const mismatch = password2.length > 0 && password !== password2;
+  const missing = mode === "import" && !nsec.trim() ? "Paste your nsec" : short ? `Password needs at least ${MIN} characters` : !password2 ? "Repeat the password" : password2 !== password ? "Make both passwords match" : null;
+
   const submit = (e: FormEvent) => {
     e.preventDefault();
+    if (missing) return;
     if (password !== password2) {
       setError("Passwords do not match.");
       return;
@@ -154,20 +160,41 @@ export function Onboarding({
         )}
         <label className="field">
           <span>Password (protects your key in this browser)</span>
-          <input type="password" autoFocus autoComplete="new-password" minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} />
+          <input
+            type="password"
+            autoFocus
+            autoComplete="new-password"
+            minLength={MIN}
+            aria-describedby="pw-hint"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
         </label>
+        <p id="pw-hint" className={`small hint ${password && !short ? "ok-text" : "muted"}`}>
+          {password && !short ? "✓ " : ""}At least {MIN} characters{short && password ? ` (${MIN - password.length} more)` : ""}
+        </p>
         <label className="field">
           <span>Repeat password</span>
-          <input type="password" autoComplete="new-password" value={password2} onChange={(e) => setPassword2(e.target.value)} />
+          <input type="password" autoComplete="new-password" aria-describedby="pw2-hint" aria-invalid={mismatch} value={password2} onChange={(e) => setPassword2(e.target.value)} />
         </label>
+        {mismatch && (
+          <p id="pw2-hint" className="small hint error-text">
+            Passwords don’t match yet
+          </p>
+        )}
         <p className="small muted">
           The key is encrypted with your password (NIP-49) and stored only in this browser. There is no account recovery — if you forget the password,
           create a new identity and ask the worker owner to authorize it.
         </p>
         {error && <p className="error-text">{error}</p>}
-        <button className="btn primary wide" disabled={busy || password.length < 8}>
+        <button className="btn primary wide" disabled={busy || !!missing}>
           {busy ? "Encrypting…" : mode === "create" ? "Create identity" : "Import"}
         </button>
+        {missing && !busy && (
+          <p className="small muted center" aria-live="polite">
+            {missing} to continue.
+          </p>
+        )}
         <button type="button" className="btn ghost wide" onClick={() => setMode("choose")}>
           Back
         </button>
