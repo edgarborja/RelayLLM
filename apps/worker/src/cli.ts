@@ -12,9 +12,11 @@ import {
   checkProviderEndpoint,
   createProvider,
   PROVIDER_DEFAULTS,
+  REASONING_MODES,
   SYSTEM_PROMPT_STYLES,
   type ProviderKind,
   type ProviderModel,
+  type ReasoningMode,
   type SystemPromptStyle,
 } from "@relayllm/provider-adapters";
 import { addUser, createInvite, removeUser } from "./access.ts";
@@ -61,6 +63,8 @@ Models
   relayllm models add <id>            Add a model that discovery does not report
   relayllm models system-style <id> system|developer|user-prefix|default
                                       How system prompts reach this model
+  relayllm models reasoning <id> toggle|effort|default
+                                      Reasoning control for engines that don't advertise one
 
 Users
   relayllm users                      List authorized users and pending requests
@@ -75,6 +79,8 @@ Configuration
   relayllm provider set [--kind K] [--url URL] [--api-key] [--no-api-key] [--allow-remote]
                        [--system-style system|developer|user-prefix]
   relayllm client-url <url>           Set the web client URL used in pairing links
+  relayllm limits [--max-tokens N] [--absolute SEC] [--inactivity SEC] [--heartbeat SEC]
+                                      Generation budget and timeouts
   relayllm monitoring [on|off] [--interval SEC] [--engine-metrics on|off]
                                       Share machine memory stats with authorized users
                                       (off by default); vLLM Prometheus stats
@@ -379,6 +385,37 @@ async function cmdStart(): Promise<void> {
   process.on("SIGTERM", () => void stop());
 }
 
+function cmdLimits(args: string[]): void {
+  const { values } = parseArgs({
+    args,
+    options: { "max-tokens": { type: "string" }, absolute: { type: "string" }, inactivity: { type: "string" }, heartbeat: { type: "string" } },
+  });
+  const num = (name: keyof typeof values, min: number, max: number): number | undefined => {
+    if (values[name] === undefined) return undefined;
+    const n = Number(values[name]);
+    if (!Number.isInteger(n) || n < min || n > max) fail(`--${name} must be a whole number from ${min} to ${max}`);
+    return n;
+  };
+  const maxTokens = num("max-tokens", 1, 1_000_000);
+  const absolute = num("absolute", 5, 86_400);
+  const inactivity = num("inactivity", 5, 86_400);
+  const heartbeat = num("heartbeat", 2, 60);
+  const changed = [maxTokens, absolute, inactivity, heartbeat].some((v) => v !== undefined);
+  const { limits } = changed
+    ? updateConfig((c) => {
+        c.limits.maxTokens = maxTokens ?? c.limits.maxTokens;
+        c.limits.requestTimeoutSec = absolute ?? c.limits.requestTimeoutSec;
+        c.limits.inactivityTimeoutSec = inactivity ?? c.limits.inactivityTimeoutSec;
+        c.limits.heartbeatSec = heartbeat ?? c.limits.heartbeatSec;
+      }, home)
+    : loadConfig(home);
+  out(`Generation budget:   ${limits.maxTokens} tokens (reasoning + answer)`);
+  out(`Absolute timeout:    ${limits.requestTimeoutSec}s`);
+  out(`Inactivity timeout:  ${limits.inactivityTimeoutSec}s without new text, once text has started`);
+  out(`Heartbeat:           every ${limits.heartbeatSec}s while a request is active`);
+  if (changed) out("A running worker applies this to new requests within a few seconds.");
+}
+
 function cmdMonitoring(args: string[]): void {
   const { values, positionals } = parseArgs({
     args,
@@ -479,6 +516,17 @@ async function cmdModels(args: string[]): Promise<void> {
       out(`${on ? "[x]" : "[ ]"} ${m.id}${flags ? `  (${flags})` : ""}`);
     }
     out('\nEnable with "relayllm models enable <id>", disable with "relayllm models disable <id>".');
+    return;
+  }
+  if (sub === "reasoning") {
+    const [id, mode] = ids;
+    const modes: readonly string[] = REASONING_MODES;
+    if (!id || !mode || (mode !== "default" && !modes.includes(mode))) fail(`usage: relayllm models reasoning <id> ${REASONING_MODES.join("|")}|default`);
+    updateConfig((c) => {
+      if (mode === "default") delete c.models.reasoning[id];
+      else c.models.reasoning[id] = mode as ReasoningMode;
+    }, home);
+    out(`Reasoning control for ${id}: ${mode === "default" ? "as advertised by the engine" : mode}. A running worker picks this up within a few seconds.`);
     return;
   }
   if (sub === "system-style") {
@@ -756,6 +804,8 @@ async function main(): Promise<void> {
       return cmdRelays(args);
     case "provider":
       return cmdProvider(args);
+    case "limits":
+      return cmdLimits(args);
     case "monitoring":
       return cmdMonitoring(args);
     case "client-url": {

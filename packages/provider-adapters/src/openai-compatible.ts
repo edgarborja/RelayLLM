@@ -1,5 +1,14 @@
 import { checkProviderEndpoint } from "./endpoint-policy.ts";
-import { readSse } from "./sse.ts";
+import {
+  classifyEngineError,
+  inferenceFetch,
+  isReasoningSetting,
+  readBounded,
+  ThinkSplitter,
+  type ReasoningMode,
+  type ReasoningSetting,
+} from "./inference.ts";
+import { readLines, readSse } from "./sse.ts";
 import { applySystemPromptStyle, type SystemPromptStyle } from "./system-prompt.ts";
 import {
   nonNeg,
@@ -12,13 +21,14 @@ import {
 } from "./metrics.ts";
 import {
   ProviderError,
-  type ChatChunk,
   type ChatRequest,
+  type InferenceEvent,
   type ProviderAdapter,
   type ProviderCapabilities,
   type ProviderHealth,
   type ProviderKind,
   type ProviderModel,
+  type TokenUsage,
 } from "./types.ts";
 
 export interface OpenAICompatibleOptions {
@@ -51,10 +61,12 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
   protected readonly apiKey?: string;
   protected readonly metaTimeoutMs: number;
   protected readonly fetch: typeof fetch;
+  /** For inference only: no hidden header/body timeouts. */
+  protected readonly chatFetch: typeof fetch;
   protected readonly systemPromptStyle: SystemPromptStyle;
   protected readonly engineMetricsEnabled: boolean;
   readonly metricsSupport: MetricsSupport = { loadState: false, maxContext: false, loadedContext: false, memory: false, engineStats: false };
-  readonly #streaming: boolean;
+  protected readonly streaming: boolean;
 
   constructor(opts: OpenAICompatibleOptions) {
     const check = checkProviderEndpoint(opts.baseUrl, { allowRemote: opts.allowRemoteEndpoint });
@@ -63,10 +75,11 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     this.apiKey = opts.apiKey || undefined;
     this.metaTimeoutMs = opts.metaTimeoutMs ?? 5000;
     this.fetch = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
-    this.#streaming = opts.streaming ?? true;
+    this.chatFetch = opts.fetchImpl ?? inferenceFetch;
+    this.streaming = opts.streaming ?? true;
     this.systemPromptStyle = opts.systemPromptStyle ?? "system";
     this.engineMetricsEnabled = opts.engineMetrics ?? false;
-    this.capabilities = { streaming: this.#streaming, cancel: true, discovery: true };
+    this.capabilities = { streaming: this.streaming, cancel: true, discovery: true };
   }
 
   /** Build a URL under the configured base. `path` is always a constant. */
@@ -180,93 +193,117 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
       .map((m) => ({ id: m.id, chat: !EMBEDDING_HINT.test(m.id) }));
   }
 
-  /** Map an engine stream delta to chunks. Subclasses may extend. */
-  protected parseDelta(delta: Record<string, unknown>): ChatChunk[] {
-    const out: ChatChunk[] = [];
+  /** Map an engine stream delta to events. Subclasses may extend. */
+  protected parseDelta(delta: Record<string, unknown>, split: ThinkSplitter): InferenceEvent[] {
+    const out: InferenceEvent[] = [];
     const reasoning = delta.reasoning_content ?? delta.reasoning;
-    if (typeof reasoning === "string" && reasoning) out.push({ type: "reasoning", text: reasoning });
-    if (typeof delta.content === "string" && delta.content) out.push({ type: "content", text: delta.content });
+    if (typeof reasoning === "string" && reasoning) out.push({ type: "reasoning.delta", text: reasoning });
+    if (typeof delta.content === "string" && delta.content) out.push(...split.push(delta.content));
     return out;
   }
 
-  async *chat(req: ChatRequest, signal: AbortSignal): AsyncIterable<ChatChunk> {
-    // Allowlisted body: no tools, functions, response_format, logit_bias, etc.
-    const body: Record<string, unknown> = {
-      model: req.model,
-      messages: applySystemPromptStyle(req.messages, req.systemPromptStyle ?? this.systemPromptStyle),
-      stream: this.#streaming,
-    };
-    if (req.temperature !== undefined) body.temperature = req.temperature;
-    if (req.top_p !== undefined) body.top_p = req.top_p;
-    if (req.max_tokens !== undefined) body.max_tokens = req.max_tokens;
-    if (this.#streaming) body.stream_options = { include_usage: true };
+  async reasoningOptions(_id: string, mode?: ReasoningMode): Promise<ReasoningSetting[]> {
+    if (mode === "toggle") return ["off", "on"];
+    if (mode === "effort") return ["off", "low", "medium", "high"];
+    return [];
+  }
 
+  /** Add this engine's reasoning control to a request body. */
+  protected applyReasoning(body: Record<string, unknown>, setting: ReasoningSetting, mode?: ReasoningMode): void {
+    if (mode === "toggle") body.chat_template_kwargs = { enable_thinking: setting !== "off" };
+    else if (mode === "effort") body.reasoning_effort = effortOf(setting);
+    else throw new ProviderError("reasoning control not supported", "unsupported");
+  }
+
+  /** Engine events; failures become generation.error, aborts throw. */
+  async *chat(req: ChatRequest, signal: AbortSignal): AsyncGenerator<InferenceEvent> {
+    try {
+      yield* this.generate(req, signal);
+    } catch (e) {
+      if (signal.aborted) throw new ProviderError("aborted", "aborted");
+      if (e instanceof ProviderError && e.code !== "aborted") yield { type: "generation.error", kind: e.code, detail: e.message };
+      else yield { type: "generation.error", kind: "bad_response", detail: "stream interrupted" };
+    }
+  }
+
+  protected async postChat(url: string, body: unknown, signal: AbortSignal): Promise<Response> {
     let res: Response;
     try {
-      res = await this.fetch(this.url("/chat/completions"), {
-        method: "POST",
-        headers: this.headers(true),
-        body: JSON.stringify(body),
-        redirect: "error",
-        signal,
-      });
+      res = await this.chatFetch(url, { method: "POST", headers: this.headers(true), body: JSON.stringify(body), redirect: "error", signal });
     } catch (e) {
       if (signal.aborted) throw new ProviderError("aborted", "aborted");
       throw new ProviderError(`request failed: ${(e as Error).name}`, "unavailable");
     }
     if (!res.ok || !res.body) {
-      // Drain a bounded amount for status only; never forward engine text.
-      try {
-        await res.body?.cancel();
-      } catch {
-        /* ignore */
-      }
-      throw new ProviderError(`HTTP ${res.status}`, "http_error", res.status);
+      // Classified locally; the engine's text is never forwarded or logged.
+      const kind = classifyEngineError(await readBounded(res));
+      throw new ProviderError(`HTTP ${res.status}`, kind === "context_overflow" ? kind : "http_error", res.status);
     }
+    return res;
+  }
 
+  protected async *generate(req: ChatRequest, signal: AbortSignal): AsyncGenerator<InferenceEvent> {
+    // Allowlisted body: no tools, functions, response_format, logit_bias, etc.
+    const body: Record<string, unknown> = {
+      model: req.model,
+      messages: applySystemPromptStyle(req.messages, req.systemPromptStyle ?? this.systemPromptStyle),
+      stream: this.streaming,
+    };
+    if (req.temperature !== undefined) body.temperature = req.temperature;
+    if (req.top_p !== undefined) body.top_p = req.top_p;
+    if (req.max_tokens !== undefined) body.max_tokens = req.max_tokens;
+    if (this.streaming) body.stream_options = { include_usage: true };
+    if (req.reasoning) this.applyReasoning(body, req.reasoning, req.reasoningMode);
+
+    const res = await this.postChat(this.url("/chat/completions"), body, signal);
+    const split = new ThinkSplitter();
     const ctype = res.headers.get("content-type") ?? "";
-    if (!this.#streaming || ctype.includes("application/json")) {
-      yield* this.#fromJson(res);
+    if (!this.streaming || ctype.includes("application/json")) {
+      yield* this.#fromJson(res, split);
       return;
     }
 
-    let finish: "stop" | "length" | "error" = "stop";
-    let usage: ReturnType<typeof mapUsage> | undefined;
-    try {
-      for await (const data of readSse(res.body, signal)) {
-        if (signal.aborted) throw new ProviderError("aborted", "aborted");
-        if (data === "[DONE]") break;
-        let obj: {
-          choices?: { delta?: Record<string, unknown>; finish_reason?: string | null }[];
-          usage?: RawUsage;
-          error?: unknown;
-        };
-        try {
-          obj = JSON.parse(data);
-        } catch {
-          continue;
-        }
-        if (obj.error) throw new ProviderError("engine reported an error", "bad_response");
-        if (obj.usage) usage = mapUsage(obj.usage);
-        const choice = obj.choices?.[0];
-        if (!choice) continue;
-        if (choice.delta) {
-          for (const c of this.parseDelta(choice.delta)) {
-            if (signal.aborted) throw new ProviderError("aborted", "aborted");
-            yield c;
-          }
-        }
-        if (choice.finish_reason === "length") finish = "length";
-      }
-    } catch (e) {
+    let finish: string | undefined;
+    let sawDone = false;
+    let usage: TokenUsage | undefined;
+    for await (const data of readSse(res.body!, signal)) {
       if (signal.aborted) throw new ProviderError("aborted", "aborted");
-      if (e instanceof ProviderError) throw e;
-      throw new ProviderError("stream interrupted", "bad_response");
+      if (data === "[DONE]") {
+        sawDone = true;
+        break;
+      }
+      let obj: {
+        choices?: { delta?: Record<string, unknown>; finish_reason?: string | null }[];
+        usage?: RawUsage | null;
+        error?: unknown;
+      };
+      try {
+        obj = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      if (obj.error) throw new ProviderError("engine reported an error", classifyEngineError(JSON.stringify(obj.error).slice(0, 8192)));
+      if (obj.usage) {
+        usage = mapUsage(obj.usage);
+        yield { type: "usage.update", usage };
+      }
+      const choice = obj.choices?.[0];
+      if (!choice) continue;
+      if (choice.delta) {
+        for (const c of this.parseDelta(choice.delta, split)) {
+          if (signal.aborted) throw new ProviderError("aborted", "aborted");
+          yield c;
+        }
+      }
+      if (choice.finish_reason) finish = choice.finish_reason;
     }
-    yield { type: "done", finishReason: finish, usage };
+    yield* split.flush();
+    // A connection that just closes is a failure, not a finished answer.
+    if (!finish && !sawDone) throw new ProviderError("stream ended early", "bad_response");
+    yield { type: "generation.complete", finishReason: finish === "length" ? "length" : "stop", usage };
   }
 
-  async *#fromJson(res: Response): AsyncIterable<ChatChunk> {
+  async *#fromJson(res: Response, split: ThinkSplitter): AsyncGenerator<InferenceEvent> {
     let obj: {
       choices?: { message?: Record<string, unknown>; finish_reason?: string }[];
       usage?: RawUsage;
@@ -278,14 +315,26 @@ export class OpenAICompatibleProvider implements ProviderAdapter {
     }
     const choice = obj.choices?.[0];
     if (!choice?.message) throw new ProviderError("no choices", "bad_response");
-    yield* this.parseDelta(choice.message);
+    yield* this.parseDelta(choice.message, split);
+    yield* split.flush();
     yield {
-      type: "done",
+      type: "generation.complete",
       finishReason: choice.finish_reason === "length" ? "length" : "stop",
       usage: obj.usage ? mapUsage(obj.usage) : undefined,
     };
   }
 }
+
+function findNativeModel(models: Record<string, unknown>[], id: string): Record<string, unknown> | undefined {
+  return models.find(
+    (x) =>
+      x?.key === id ||
+      (Array.isArray(x?.variants) && x.variants.includes(id)) ||
+      (Array.isArray(x?.loaded_instances) && x.loaded_instances.some((i: { id?: unknown }) => i?.id === id)),
+  );
+}
+
+const effortOf = (s: ReasoningSetting): string => (s === "off" ? "none" : s === "on" ? "medium" : s);
 
 /**
  * LM Studio (including Bionic). Uses the native /api/v0/models endpoint for
@@ -297,6 +346,23 @@ export class LMStudioProvider extends OpenAICompatibleProvider {
   override readonly metricsSupport: MetricsSupport = { loadState: true, maxContext: true, loadedContext: true, memory: false, engineStats: false };
 
   /**
+   * Models advertise their reasoning settings in /api/v1/models. Inference uses
+   * /v1 with reasoning_effort: the native /api/v1/chat has richer events, but
+   * keeps conversation state in the engine (it takes no assistant history) and
+   * can enable MCP integrations, so it doesn't fit a stateless gateway.
+   */
+  override async reasoningOptions(id: string): Promise<ReasoningSetting[]> {
+    const body = (await this.getJson(this.originUrl("/api/v1/models"))) as { models?: Record<string, unknown>[] };
+    const m = Array.isArray(body?.models) ? findNativeModel(body.models, id) : undefined;
+    const allowed = (m?.capabilities as { reasoning?: { allowed_options?: unknown } } | undefined)?.reasoning?.allowed_options;
+    return Array.isArray(allowed) ? allowed.filter(isReasoningSetting) : [];
+  }
+
+  protected override applyReasoning(body: Record<string, unknown>, setting: ReasoningSetting): void {
+    body.reasoning_effort = effortOf(setting);
+  }
+
+  /**
    * Native REST API: /api/v1/models (LM Studio 0.4+/Bionic) has the loaded
    * instances' configured context; /api/v0/models is the fallback.
    * Inference still goes through the OpenAI-compatible /v1 endpoints.
@@ -305,12 +371,7 @@ export class LMStudioProvider extends OpenAICompatibleProvider {
     try {
       const body = (await this.getJson(this.originUrl("/api/v1/models"))) as { models?: Record<string, unknown>[] };
       if (Array.isArray(body?.models)) {
-        const m = body.models.find(
-          (x) =>
-            x?.key === id ||
-            (Array.isArray(x?.variants) && x.variants.includes(id)) ||
-            (Array.isArray(x?.loaded_instances) && x.loaded_instances.some((i: { id?: unknown }) => i?.id === id)),
-        );
+        const m = findNativeModel(body.models, id);
         if (m) {
           const instances = Array.isArray(m.loaded_instances) ? (m.loaded_instances as { id?: unknown; config?: { context_length?: unknown } }[]) : [];
           const inst = instances.find((i) => i?.id === id) ?? instances[0];
@@ -370,10 +431,73 @@ export class LMStudioProvider extends OpenAICompatibleProvider {
   }
 }
 
-/** Ollama: OpenAI-compatible chat at /v1, native discovery at /api/tags. */
+/** Ollama: native chat at /api/chat, native discovery at /api/tags. */
 export class OllamaProvider extends OpenAICompatibleProvider {
   override readonly kind: ProviderKind = "ollama";
   override readonly metricsSupport: MetricsSupport = { loadState: true, maxContext: true, loadedContext: true, memory: true, engineStats: false };
+
+  override async reasoningOptions(id: string): Promise<ReasoningSetting[]> {
+    const show = (await this.getJson(this.originUrl("/api/show"), { model: id })) as { capabilities?: unknown; details?: { family?: unknown } };
+    if (!Array.isArray(show?.capabilities) || !show.capabilities.includes("thinking")) return [];
+    // gpt-oss takes levels and can't be switched off; other models take true/false.
+    return /^gpt-?oss/i.test(String(show.details?.family ?? "")) ? ["low", "medium", "high"] : ["off", "on"];
+  }
+
+  /** Native /api/chat: separate `thinking` text, `think` control, and engine token counts. */
+  protected override async *generate(req: ChatRequest, signal: AbortSignal): AsyncGenerator<InferenceEvent> {
+    const options: Record<string, unknown> = {};
+    if (req.temperature !== undefined) options.temperature = req.temperature;
+    if (req.top_p !== undefined) options.top_p = req.top_p;
+    if (req.max_tokens !== undefined) options.num_predict = req.max_tokens;
+    const body: Record<string, unknown> = {
+      model: req.model,
+      messages: applySystemPromptStyle(req.messages, req.systemPromptStyle ?? this.systemPromptStyle),
+      stream: this.streaming,
+      options,
+    };
+    if (req.reasoning) body.think = req.reasoning === "off" ? false : req.reasoning === "on" ? true : req.reasoning;
+
+    let res: Response;
+    try {
+      res = await this.postChat(this.originUrl("/api/chat"), body, signal);
+    } catch (e) {
+      // Behind a proxy that only exposes /v1: use the compatible API instead.
+      if (e instanceof ProviderError && (e.status === 404 || e.status === 405)) {
+        yield* super.generate({ ...req, reasoningMode: "effort" }, signal);
+        return;
+      }
+      throw e;
+    }
+    const split = new ThinkSplitter();
+    for await (const line of readLines(res.body!, signal)) {
+      if (signal.aborted) throw new ProviderError("aborted", "aborted");
+      if (!line.trim()) continue;
+      let obj: {
+        message?: { content?: unknown; thinking?: unknown };
+        done?: boolean;
+        done_reason?: string;
+        prompt_eval_count?: number;
+        eval_count?: number;
+        error?: unknown;
+      };
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (obj.error) throw new ProviderError("engine reported an error", classifyEngineError(String(obj.error).slice(0, 8192)));
+      if (typeof obj.message?.thinking === "string" && obj.message.thinking) yield { type: "reasoning.delta", text: obj.message.thinking };
+      if (typeof obj.message?.content === "string" && obj.message.content) yield* split.push(obj.message.content);
+      if (obj.done) {
+        yield* split.flush();
+        const usage = mapUsage({ prompt_tokens: obj.prompt_eval_count, completion_tokens: obj.eval_count });
+        yield { type: "usage.update", usage };
+        yield { type: "generation.complete", finishReason: obj.done_reason === "length" ? "length" : "stop", usage };
+        return;
+      }
+    }
+    throw new ProviderError("stream ended early", "bad_response");
+  }
 
   /** /api/ps (load state, memory, allocated context) + /api/show (model limits, num_ctx). */
   override async modelInfo(id: string): Promise<ModelRuntimeInfo> {

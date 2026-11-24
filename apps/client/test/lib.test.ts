@@ -5,6 +5,7 @@ import * as nip19 from "nostr-tools/nip19";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { buildContext } from "../src/lib/context.ts";
 import { LocalDB, type Conversation } from "../src/lib/db.ts";
+import { describeFailure, describeLive, describeTruncation, effectiveReasoning, type LiveGeneration } from "../src/lib/generation.ts";
 import { estimateContext, estimateTokens } from "../src/lib/metrics.ts";
 import { describePrompt, rememberPrompt, TEMPLATES } from "../src/lib/prompts.ts";
 import { createLocalIdentity, loadStoredIdentity, revealNsec, unlockLocal, WrongPasswordError } from "../src/lib/identity.ts";
@@ -258,5 +259,42 @@ describe("context accounting", () => {
     expect(estimateContext([], undefined, undefined)).toEqual({ tokens: 0, basis: "none" });
     // A new chat with only a system prompt still counts it.
     expect(estimateContext([], "z".repeat(40), undefined)).toMatchObject({ tokens: 4 + 10, basis: "estimated" });
+  });
+});
+
+describe("generation status and explanations", () => {
+  const status = (o: object) => ({ v: 1, id: "x", exp: 1, type: "chat.status" as const, re: "y", n: 1, state: "thinking" as const, progress: "active" as const, elapsedMs: 5000, sinceProgressMs: 100, deltaCount: 1, reasoningTokens: 50, answerTokens: null, tokensPerSecond: 20, ...o });
+  const live = (o: Partial<LiveGeneration> = {}): LiveGeneration => ({ startedAt: 0, acked: true, lastContactAt: 60_000, heartbeatSec: 10, ...o });
+  const empty = { content: "" };
+
+  it("sends a reasoning preference only when the model supports it", () => {
+    expect(effectiveReasoning("off", ["off", "on"])).toBe("off");
+    expect(effectiveReasoning("high", ["off", "on"])).toBeUndefined();
+    expect(effectiveReasoning("off", undefined)).toBeUndefined();
+    expect(effectiveReasoning("auto", ["off"])).toBeUndefined();
+    expect(effectiveReasoning(undefined, ["off"])).toBeUndefined();
+  });
+
+  it("keeps worker health, relay health and inference progress apart", () => {
+    const at = 62_000;
+    expect(describeLive(live({ acked: false }), empty, true, at).label).toBe("Queued");
+    expect(describeLive(live(), empty, true, at).label).toBe("Processing prompt"); // older worker, no status
+    expect(describeLive(live(), { content: "hi" }, true, at).label).toBe("Generating answer");
+    expect(describeLive(live({ status: status({}) }), empty, true, at)).toMatchObject({ label: "Thinking", tokens: "~50 reasoning tokens", speed: "~20.0 tok/s", note: undefined });
+    expect(describeLive(live({ status: status({}) }), empty, false, at).note).toMatch(/Relays disconnected/);
+    expect(describeLive(live({ status: status({}) }), empty, true, 100_000).note).toMatch(/No heartbeat/);
+    expect(describeLive(live({ status: status({ progress: "unknown", state: "prompt", elapsedMs: 60_000, sinceProgressMs: null }) }), empty, true, at).note).toMatch(/hasn't reported progress/);
+    expect(describeLive(live({ status: status({ progress: "quiet", sinceProgressMs: 30_000 }) }), empty, true, at).note).toMatch(/No new text for 32 s/);
+  });
+
+  it("never mislabels limits as timeouts", () => {
+    expect(describeTruncation({ content: "", reasoning: "r", usage: { detail: "token_budget", maxTokens: 8192 } })).toMatch(/budget \(8,192 tokens\) was used up by reasoning/);
+    expect(describeTruncation({ content: "partial", usage: { detail: "token_budget" } })).toMatch(/cut off/);
+    expect(describeTruncation({ content: "partial" })).toMatch(/cut off/); // older worker
+    expect(describeTruncation({ content: "x", usage: { detail: "context_full" } })).toMatch(/context window/);
+    for (const d of ["context_full", "stream_ended", "worker_shutdown"] as const) expect(describeFailure("provider_error", { detail: d })).not.toMatch(/time ?out|time limit/);
+    expect(describeFailure("timeout", { detail: "absolute_timeout" })).toMatch(/time limit/);
+    expect(describeFailure("timeout", { detail: "inactivity" })).toMatch(/stopped producing/);
+    expect(describeFailure("provider_unavailable", undefined)).toMatch(/not reachable/);
   });
 });

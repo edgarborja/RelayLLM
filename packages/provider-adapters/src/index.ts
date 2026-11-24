@@ -12,6 +12,7 @@ export * from "./endpoint-policy.ts";
 export * from "./openai-compatible.ts";
 export * from "./system-prompt.ts";
 export * from "./metrics.ts";
+export * from "./inference.ts";
 export { readSse } from "./sse.ts";
 
 export const PROVIDER_DEFAULTS: Record<ProviderKind, { label: string; baseUrls: string[] }> = {

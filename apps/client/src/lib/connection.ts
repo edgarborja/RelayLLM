@@ -4,6 +4,7 @@ import {
   RelayPool,
   RemoteError,
   WorkerClient,
+  type CancelOutcome,
   type ChatHandle,
   type ChatCallbacks,
   type RelayStatus,
@@ -132,7 +133,13 @@ export class WorkerConnection {
   }
 
   chat(req: { model: string; messages: ChatMessage[]; params?: ChatParams }, cb: ChatCallbacks): ChatHandle {
-    return this.client.chat(req, cb);
+    // The worker enforces the limit; wait a little longer than it does.
+    const limit = this.#state.limits?.requestTimeoutSec;
+    return this.client.chat(req, cb, { timeoutMs: limit ? (limit + 60) * 1000 : undefined });
+  }
+
+  cancelRequest(id: string): Promise<CancelOutcome> {
+    return this.client.cancelRequest(id);
   }
 
   close(): void {

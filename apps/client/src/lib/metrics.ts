@@ -34,7 +34,7 @@ export function estimateContext(messages: readonly ChatMessageRecord[], systemPr
 
   const u = lastReply?.usage;
   if (lastReply && u?.source === "measured" && u.promptTokens !== undefined && u.completionTokens !== undefined) {
-    const visibleOutput = Math.max(0, u.completionTokens - (u.reasoningTokens ?? 0));
+    const visibleOutput = u.sources?.answer === "provider" && u.answerTokens !== undefined ? u.answerTokens : Math.max(0, u.completionTokens - (u.reasoningTokens ?? 0));
     const after = messages.slice(messages.indexOf(lastReply) + 1).filter((m) => (m.role === "user" || m.role === "assistant") && m.content.trim() && m.status !== "error");
     const extra = after.reduce((n, m) => n + MESSAGE_OVERHEAD + estimateTokens(m.content), 0);
     return { tokens: u.promptTokens + visibleOutput + extra, basis: extra ? "mixed" : "measured", last: u };

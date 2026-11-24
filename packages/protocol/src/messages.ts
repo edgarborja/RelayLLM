@@ -49,12 +49,18 @@ export const ChatMessage = z.object({
 });
 export type ChatMessage = z.infer<typeof ChatMessage>;
 
+/** Reasoning settings. "auto" (the model's default) is expressed by omitting it. */
+export const ReasoningSetting = z.enum(["off", "on", "minimal", "low", "medium", "high", "xhigh"]);
+export type ReasoningSetting = z.infer<typeof ReasoningSetting>;
+
 /** Generation parameters. Only these are ever forwarded to a provider. */
 export const ChatParams = z
   .object({
     temperature: z.number().min(0).max(2).optional(),
     top_p: z.number().min(0).max(1).optional(),
     max_tokens: z.number().int().min(1).max(1_000_000).optional(),
+    /** Only send values the model lists in ModelInfo.reasoningOptions. */
+    reasoning: ReasoningSetting.optional(),
   })
   .strict();
 export type ChatParams = z.infer<typeof ChatParams>;
@@ -135,6 +141,12 @@ export const ModelInfo = z.object({
   streaming: z.boolean(),
   cancel: z.boolean(),
   reasoning: z.boolean().optional(),
+  /** Reasoning settings this model accepts; absent or empty = no control. Unknown values are dropped. */
+  reasoningOptions: z
+    .array(z.string())
+    .max(20)
+    .transform((a) => a.filter((x): x is ReasoningSetting => ReasoningSetting.safeParse(x).success))
+    .optional(),
 });
 export type ModelInfo = z.infer<typeof ModelInfo>;
 
@@ -142,7 +154,13 @@ export const Limits = z.object({
   maxRequestBytes: z.number().int(),
   maxResponseChars: z.number().int(),
   maxMessages: z.number().int(),
+  /** Absolute request timeout, enforced by the worker. */
   requestTimeoutSec: z.number().int(),
+  /** Worker heartbeat (chat.status) interval while a request is active. Absent on older workers. */
+  heartbeatSec: z.number().optional(),
+  inactivityTimeoutSec: z.number().optional(),
+  /** Largest generation budget (reasoning + answer). */
+  maxTokens: z.number().int().optional(),
   /** Max total length of leading system instructions (optional for older workers). */
   maxSystemPromptChars: z.number().int().optional(),
 });
@@ -188,6 +206,23 @@ export const ChatDelta = z
 export const TokenSource = z.enum(["measured", "estimated"]);
 export type TokenSource = z.infer<typeof TokenSource>;
 
+/** How a token count was obtained. Absent count = unavailable. */
+export const CountSource = z.enum(["exact", "provider", "estimated"]);
+export type CountSource = z.infer<typeof CountSource>;
+
+/** Why a generation ended early; more specific than finishReason. */
+export const FinishDetail = z.enum([
+  "token_budget",
+  "context_full",
+  "engine_limit",
+  "response_size",
+  "inactivity",
+  "absolute_timeout",
+  "stream_ended",
+  "worker_shutdown",
+]);
+export type FinishDetail = z.infer<typeof FinishDetail>;
+
 export const FinishReason = z.enum(["stop", "length", "cancelled", "error", "timeout"]);
 
 export const ChatComplete = z
@@ -215,8 +250,78 @@ export const ChatComplete = z
         /** Time from request to first generated token. */
         firstTokenMs: z.number().int().nonnegative().optional(),
         generationMs: z.number().int().nonnegative().optional(),
+        // This object ignores unknown fields, so everything below is
+        // invisible to clients that predate it.
+        /** Visible output tokens (completionTokens without reasoning). */
+        answerTokens: z.number().int().nonnegative().optional(),
+        sources: z
+          .object({
+            prompt: CountSource.optional(),
+            completion: CountSource.optional(),
+            reasoning: CountSource.optional(),
+            answer: CountSource.optional(),
+          })
+          .optional(),
+        /** Generation budget sent to the engine for this request. */
+        maxTokens: z.number().int().optional(),
+        /** Loaded context window, when the engine reports it. */
+        contextWindow: z.number().int().optional(),
+        firstReasoningMs: z.number().int().nonnegative().optional(),
+        firstAnswerMs: z.number().int().nonnegative().optional(),
+        /** Inference start to end, on the worker's monotonic clock. */
+        inferenceMs: z.number().int().nonnegative().optional(),
+        detail: FinishDetail.optional().catch(undefined),
       })
       .optional(),
+  })
+  .strict();
+
+export const GenerationState = z.enum(["loading", "prompt", "thinking", "answering", "finishing"]);
+export type GenerationState = z.infer<typeof GenerationState>;
+
+/**
+ * Worker heartbeat and live statistics for an active chat. Sent on state
+ * changes and every heartbeatSec. It proves the worker is alive; only
+ * `sinceProgressMs` says anything about the inference itself.
+ */
+export const ChatStatus = z
+  .object({
+    ...base,
+    type: z.literal("chat.status"),
+    re: MessageId,
+    /** Increases with each status, so late or duplicate ones are ignored. */
+    n: z.number().int().min(0),
+    state: GenerationState,
+    /**
+     * active: text arrived recently; quiet: text was arriving but has paused;
+     * unknown: the engine has shown no progress yet and may simply not expose it.
+     */
+    progress: z.enum(["active", "quiet", "unknown"]),
+    elapsedMs: z.number().int().nonnegative(),
+    sinceProgressMs: z.number().int().nonnegative().nullable(),
+    /** chat.delta messages published so far (detects a lost tail). */
+    deltaCount: z.number().int().min(0),
+    /** Estimated from text so far; null = none seen. */
+    reasoningTokens: z.number().int().nonnegative().nullable(),
+    answerTokens: z.number().int().nonnegative().nullable(),
+    tokensPerSecond: z.number().nonnegative().nullable(),
+  })
+  .strict();
+export type ChatStatus = z.infer<typeof ChatStatus>;
+
+export const ChatCancelRes = z
+  .object({
+    ...base,
+    type: z.literal("chat.cancel.result"),
+    re: MessageId,
+    target: MessageId,
+    /**
+     * cancelled: the engine request was torn down; finished: it had already
+     * ended; not_found: nothing with that id is running for this user (a start
+     * that arrives later is refused); unconfirmed: the engine request was
+     * aborted but didn't confirm in time.
+     */
+    status: z.enum(["cancelled", "finished", "not_found", "unconfirmed"]),
   })
   .strict();
 
@@ -348,6 +453,8 @@ export const WorkerMessage = z.discriminatedUnion("type", [
   ChatAck,
   ChatDelta,
   ChatComplete,
+  ChatStatus,
+  ChatCancelRes,
   ServerError,
   PairRes,
   MetricsRes,

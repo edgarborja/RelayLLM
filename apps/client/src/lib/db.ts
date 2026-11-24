@@ -1,4 +1,5 @@
 import { openDB, deleteDB, type IDBPDatabase } from "idb";
+import type { ReasoningPref } from "./generation.ts";
 import type { UsageRecord } from "./metrics.ts";
 import type { SavedPrompt } from "./prompts.ts";
 
@@ -37,6 +38,12 @@ export interface ChatMessageRecord {
   omitted?: number;
   /** Token counts and speed reported by the worker for this reply. */
   usage?: UsageRecord;
+  /** Client-side durations, in ms (monotonic clock). */
+  timing?: { ackMs?: number; totalMs: number };
+  /** Worker request id, to stop it after a page reload. */
+  requestId?: string;
+  /** Interrupted, but the worker didn't confirm that it stopped. */
+  stopUnconfirmed?: boolean;
 }
 
 export interface Conversation {
@@ -53,6 +60,8 @@ export interface Conversation {
    * means no system prompt. Editing it affects only later requests.
    */
   systemPrompt?: string;
+  /** Absent = auto. */
+  reasoning?: ReasoningPref;
 }
 
 /** Encrypted, per-identity settings (unlike prefs in localStorage). */

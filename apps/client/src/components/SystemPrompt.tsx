@@ -1,7 +1,10 @@
 import { useId, useState } from "react";
+import type { ReasoningSetting } from "@relayllm/protocol";
+import type { ReasoningPref } from "../lib/generation.ts";
 import { describePrompt, sortLibrary, TEMPLATES, type SavedPrompt } from "../lib/prompts.ts";
 import { Modal } from "./Dialogs.tsx";
 import { IconPlus, IconTrash } from "./icons.tsx";
+import { ReasoningSelector } from "./Reasoning.tsx";
 
 /** Options for "insert a prompt" pickers: none, default, templates, saved. */
 function PromptPicker({
@@ -109,20 +112,28 @@ export function SystemPromptEditor(p: PromptEditorProps) {
 
 /** Edit the prompt of an existing conversation. */
 export function SystemPromptDialog(
-  props: Omit<PromptEditorProps, "value" | "onChange"> & { initial: string; onSave: (v: string) => void; onClose: () => void },
+  props: Omit<PromptEditorProps, "value" | "onChange"> & {
+    initial: string;
+    reasoning: ReasoningPref;
+    reasoningOptions: readonly ReasoningSetting[];
+    onSave: (v: string, reasoning: ReasoningPref) => void;
+    onClose: () => void;
+  },
 ) {
   const [value, setValue] = useState(props.initial);
-  const changed = value.trim() !== props.initial.trim();
+  const [reasoning, setReasoning] = useState(props.reasoning);
+  const changed = value.trim() !== props.initial.trim() || reasoning !== props.reasoning;
   return (
-    <Modal title="Conversation system prompt" onClose={props.onClose}>
+    <Modal title="Conversation settings" onClose={props.onClose}>
       <form
         className="stack"
         onSubmit={(e) => {
           e.preventDefault();
-          if (value.length <= props.maxChars) props.onSave(value);
+          if (value.length <= props.maxChars) props.onSave(value, reasoning);
         }}
       >
         <SystemPromptEditor {...props} value={value} onChange={setValue} autoFocus />
+        <ReasoningSelector value={reasoning} options={props.reasoningOptions} onChange={setReasoning} />
         <p className="small muted">Changes apply to the next replies in this conversation. Earlier messages are not changed.</p>
         <div className="row end">
           <button type="button" className="btn ghost" onClick={props.onClose}>

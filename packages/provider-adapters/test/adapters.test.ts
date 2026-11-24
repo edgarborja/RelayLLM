@@ -8,13 +8,15 @@ import {
   OpenAICompatibleProvider,
   ProviderError,
   applySystemPromptStyle,
+  classifyEngineError,
   parsePrometheus,
+  ThinkSplitter,
   VLLMProvider,
-  type ChatChunk,
+  type InferenceEvent,
 } from "../src/index.ts";
 
-async function collect(it: AsyncIterable<ChatChunk>): Promise<ChatChunk[]> {
-  const out: ChatChunk[] = [];
+async function collect(it: AsyncIterable<InferenceEvent>): Promise<InferenceEvent[]> {
+  const out: InferenceEvent[] = [];
   for await (const c of it) out.push(c);
   return out;
 }
@@ -70,17 +72,15 @@ describe("LM Studio adapter (against mock server)", () => {
   it("sends the API key and streams reasoning + content", async () => {
     const p = new LMStudioProvider({ baseUrl: mock.baseUrl, apiKey: "sk-local" });
     const chunks = await collect(p.chat({ model: "mock-llm-small", messages: [{ role: "user", content: "hi" }] }, new AbortController().signal));
-    expect(chunks.filter((c) => c.type === "reasoning").map((c) => (c as { text: string }).text).join("")).toBe("hmm");
-    expect(chunks.filter((c) => c.type === "content").map((c) => (c as { text: string }).text).join("")).toBe("Echo: hi");
-    expect(chunks.at(-1)).toMatchObject({ type: "done", finishReason: "stop", usage: { completionTokens: 3, reasoningTokens: 1 } });
+    expect(chunks.filter((c) => c.type === "reasoning.delta").map((c) => (c as { text: string }).text).join("")).toBe("hmm");
+    expect(chunks.filter((c) => c.type === "answer.delta").map((c) => (c as { text: string }).text).join("")).toBe("Echo: hi");
+    expect(chunks.at(-1)).toMatchObject({ type: "generation.complete", finishReason: "stop", usage: { completionTokens: 3, reasoningTokens: 1 } });
   });
 
   it("reports auth failures as provider errors without leaking the body", async () => {
     const p = new LMStudioProvider({ baseUrl: mock.baseUrl, apiKey: "wrong" });
-    const err = await collect(p.chat({ model: "x", messages: [{ role: "user", content: "hi" }] }, new AbortController().signal)).catch((e) => e);
-    expect(err).toBeInstanceOf(ProviderError);
-    expect(err.status).toBe(401);
-    expect(err.message).toBe("HTTP 401");
+    const events = await collect(p.chat({ model: "x", messages: [{ role: "user", content: "hi" }] }, new AbortController().signal));
+    expect(events).toEqual([{ type: "generation.error", kind: "http_error", detail: "HTTP 401" }]);
   });
 
   it("works without streaming (non-streaming fallback)", async () => {
@@ -88,8 +88,8 @@ describe("LM Studio adapter (against mock server)", () => {
     expect(p.capabilities.streaming).toBe(false);
     const chunks = await collect(p.chat({ model: "m", messages: [{ role: "user", content: "yo" }] }, new AbortController().signal));
     expect(chunks).toEqual([
-      { type: "content", text: "Echo: yo" },
-      { type: "done", finishReason: "stop", usage: { promptTokens: 5, completionTokens: 2 } },
+      { type: "answer.delta", text: "Echo: yo" },
+      { type: "generation.complete", finishReason: "stop", usage: { promptTokens: 5, completionTokens: 2 } },
     ]);
   });
 
@@ -137,7 +137,7 @@ describe("Ollama adapter (simulated Ollama API)", () => {
     expect(calls).toEqual(["/api/version", "/api/tags"]);
   });
 
-  it("streams via the OpenAI-compatible endpoint, including the `reasoning` field", async () => {
+  it("falls back to the OpenAI-compatible endpoint when the native API is absent, including the `reasoning` field", async () => {
     let body: Record<string, unknown> = {};
     const { fn } = fakeFetch({
       "/v1/chat/completions": (init) => {
@@ -153,10 +153,10 @@ describe("Ollama adapter (simulated Ollama API)", () => {
     const p = createProvider("ollama", { baseUrl: "http://localhost:11434/v1", fetchImpl: fn });
     const chunks = await collect(p.chat({ model: "llama3.2:3b", messages: [{ role: "user", content: "hi" }], max_tokens: 10 }, new AbortController().signal));
     expect(chunks).toEqual([
-      { type: "reasoning", text: "thinking" },
-      { type: "content", text: "Hel" },
-      { type: "content", text: "lo" },
-      { type: "done", finishReason: "length", usage: undefined },
+      { type: "reasoning.delta", text: "thinking" },
+      { type: "answer.delta", text: "Hel" },
+      { type: "answer.delta", text: "lo" },
+      { type: "generation.complete", finishReason: "length", usage: undefined },
     ]);
     expect(body).toEqual({
       model: "llama3.2:3b",
@@ -179,7 +179,7 @@ describe("vLLM / generic adapters", () => {
       expect(p.kind).toBe(kind);
       expect((await p.listModels())[0]).toEqual({ id: "Qwen/Qwen2.5-7B-Instruct", chat: true });
       const chunks = await collect(p.chat({ model: "Qwen/Qwen2.5-7B-Instruct", messages: [{ role: "user", content: "x" }] }, new AbortController().signal));
-      expect(chunks[0]).toEqual({ type: "content", text: "ok" });
+      expect(chunks[0]).toEqual({ type: "answer.delta", text: "ok" });
     }
     expect(new Set(calls)).toEqual(new Set(["/v1/models", "/v1/chat/completions"]));
   });
@@ -197,8 +197,8 @@ describe("vLLM / generic adapters", () => {
   it("reports an unreachable engine as unavailable", async () => {
     const p = createProvider("vllm", { baseUrl: "http://127.0.0.1:1/v1", metaTimeoutMs: 1000 });
     expect((await p.health()).ok).toBe(false);
-    const err = await collect(p.chat({ model: "m", messages: [{ role: "user", content: "x" }] }, new AbortController().signal)).catch((e) => e);
-    expect(err.code).toBe("unavailable");
+    const events = await collect(p.chat({ model: "m", messages: [{ role: "user", content: "x" }] }, new AbortController().signal));
+    expect(events).toMatchObject([{ type: "generation.error", kind: "unavailable" }]);
   });
 });
 
@@ -425,6 +425,129 @@ describe("model metrics: generic OpenAI-compatible", () => {
     });
     const p = createProvider("openai-compatible", { baseUrl: "http://localhost:8080/v1", fetchImpl: fn });
     const chunks = await collect(p.chat({ model: "m", messages: [{ role: "user", content: "hi" }] }, new AbortController().signal));
-    expect(chunks.at(-1)).toEqual({ type: "done", finishReason: "stop", usage: { promptTokens: 12, completionTokens: 299, reasoningTokens: 297 } });
+    expect(chunks.at(-1)).toEqual({ type: "generation.complete", finishReason: "stop", usage: { promptTokens: 12, completionTokens: 299, reasoningTokens: 297 } });
+  });
+});
+
+// ---------------------------------------------------------------- reasoning and inference events
+
+const signal = () => new AbortController().signal;
+const ask = { model: "m", messages: [{ role: "user" as const, content: "hi" }] };
+
+/** Capture the request body sent to a path, answering with a trivial stream. */
+function capture(path: string, extra: Parameters<typeof fakeFetch>[0] = {}) {
+  const bodies: Record<string, unknown>[] = [];
+  const { fn, calls } = fakeFetch({
+    ...extra,
+    [path]: (init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return path === "/api/chat" ? new Response('{"message":{"content":"ok"},"done":false}\n{"done":true,"done_reason":"stop"}\n') : sse([{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }, "[DONE]"]);
+    },
+  });
+  return { fn, calls, bodies };
+}
+
+describe("reasoning controls", () => {
+  it("LM Studio: options come from the model's capabilities, sent as reasoning_effort", async () => {
+    const { fn, bodies } = capture("/v1/chat/completions", {
+      "/api/v1/models": () =>
+        json({
+          models: [
+            { key: "qwen", capabilities: { reasoning: { allowed_options: ["off", "on"], default: "on" } } },
+            { key: "gpt-oss", capabilities: { reasoning: { allowed_options: ["low", "medium", "high", "telepathy"] } } },
+            { key: "plain", capabilities: { vision: false } },
+          ],
+        }),
+    });
+    const p = new LMStudioProvider({ baseUrl: "http://localhost:1234/v1", fetchImpl: fn });
+    expect(await p.reasoningOptions("qwen")).toEqual(["off", "on"]);
+    expect(await p.reasoningOptions("gpt-oss")).toEqual(["low", "medium", "high"]);
+    expect(await p.reasoningOptions("plain")).toEqual([]);
+    for (const reasoning of ["off", "on", "high", undefined] as const) await collect(p.chat({ ...ask, reasoning }, signal()));
+    expect(bodies.map((b) => b.reasoning_effort)).toEqual(["none", "medium", "high", undefined]);
+  });
+
+  it("Ollama: uses the native think field and thinking text, with engine counts", async () => {
+    const { fn, bodies, calls } = capture("/api/chat", {
+      "/api/show": (init) => {
+        const model = JSON.parse(String(init?.body)).model;
+        return json(model === "gpt-oss" ? { capabilities: ["completion", "thinking"], details: { family: "gptoss" } } : model === "qwen3" ? { capabilities: ["completion", "thinking"], details: { family: "qwen3" } } : { capabilities: ["completion"] });
+      },
+    });
+    const p = new OllamaProvider({ baseUrl: "http://localhost:11434/v1", fetchImpl: fn });
+    expect(await p.reasoningOptions("qwen3")).toEqual(["off", "on"]);
+    expect(await p.reasoningOptions("gpt-oss")).toEqual(["low", "medium", "high"]);
+    expect(await p.reasoningOptions("llama")).toEqual([]);
+    for (const reasoning of ["off", "on", "low", undefined] as const) await collect(p.chat({ ...ask, max_tokens: 50, reasoning }, signal()));
+    expect(bodies.map((b) => b.think)).toEqual([false, true, "low", undefined]);
+    expect(bodies[0]!.options).toEqual({ num_predict: 50 });
+    expect(calls).not.toContain("/v1/chat/completions");
+
+    const stream = [
+      { message: { role: "assistant", content: "", thinking: "hmm " }, done: false },
+      { message: { role: "assistant", content: "", thinking: "ok" }, done: false },
+      { message: { role: "assistant", content: "42" }, done: false },
+      { message: { role: "assistant", content: "" }, done: true, done_reason: "length", prompt_eval_count: 9, eval_count: 30 },
+    ];
+    const q = new OllamaProvider({ baseUrl: "http://localhost:11434/v1", fetchImpl: fakeFetch({ "/api/chat": () => new Response(stream.map((x) => JSON.stringify(x)).join("\n") + "\n") }).fn });
+    expect(await collect(q.chat(ask, signal()))).toEqual([
+      { type: "reasoning.delta", text: "hmm " },
+      { type: "reasoning.delta", text: "ok" },
+      { type: "answer.delta", text: "42" },
+      { type: "usage.update", usage: { promptTokens: 9, completionTokens: 30, reasoningTokens: undefined } },
+      { type: "generation.complete", finishReason: "length", usage: { promptTokens: 9, completionTokens: 30, reasoningTokens: undefined } },
+    ]);
+    const cut = new OllamaProvider({ baseUrl: "http://localhost:11434/v1", fetchImpl: fakeFetch({ "/api/chat": () => new Response('{"message":{"content":"par"},"done":false}\n') }).fn });
+    expect((await collect(cut.chat(ask, signal()))).at(-1)).toMatchObject({ type: "generation.error", detail: "stream ended early" });
+  });
+
+  it("vLLM and generic servers: no control unless the owner declares one", async () => {
+    const { fn, bodies } = capture("/v1/chat/completions");
+    const p = new VLLMProvider({ baseUrl: "http://localhost:8000/v1", fetchImpl: fn });
+    expect(await p.reasoningOptions("m")).toEqual([]);
+    expect(await collect(p.chat({ ...ask, reasoning: "off" }, signal()))).toMatchObject([{ type: "generation.error", kind: "unsupported" }]);
+    expect(bodies).toEqual([]); // nothing was sent to the engine
+    expect(await p.reasoningOptions("m", "toggle")).toEqual(["off", "on"]);
+    expect(await p.reasoningOptions("m", "effort")).toEqual(["off", "low", "medium", "high"]);
+    await collect(p.chat({ ...ask, reasoning: "off", reasoningMode: "toggle" }, signal()));
+    await collect(p.chat({ ...ask, reasoning: "high", reasoningMode: "effort" }, signal()));
+    expect(bodies[0]!.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(bodies[1]!.reasoning_effort).toBe("high");
+  });
+});
+
+describe("inference events", () => {
+  const run = (events: unknown[]) => collect(createProvider("vllm", { baseUrl: "http://localhost:8000/v1", fetchImpl: fakeFetch({ "/v1/chat/completions": () => sse(events) }).fn }).chat(ask, signal()));
+
+  it("reads vLLM's reasoning_content and reasoning fields as reasoning, not answer", async () => {
+    const ev = await run([{ choices: [{ delta: { reasoning_content: "a" } }] }, { choices: [{ delta: { reasoning: "b" } }] }, { choices: [{ delta: { content: "c" }, finish_reason: "stop" }] }, "[DONE]"]);
+    expect(ev.map((e) => e.type)).toEqual(["reasoning.delta", "reasoning.delta", "answer.delta", "generation.complete"]);
+  });
+
+  it("does not report a dropped connection as a finished answer", async () => {
+    expect((await run([{ choices: [{ delta: { content: "half" } }] }])).at(-1)).toEqual({ type: "generation.error", kind: "bad_response", detail: "stream ended early" });
+  });
+
+  it("recognizes context overflow without forwarding engine text", async () => {
+    const bionic = "The number of tokens to keep from the initial prompt is greater than the context length. Try to load the model with a larger context length /Users/x";
+    const ev = await run([{ error: { message: bionic } }]);
+    expect(ev).toEqual([{ type: "generation.error", kind: "context_overflow", detail: "engine reported an error" }]);
+    expect(classifyEngineError("This model's maximum context length is 4096 tokens.")).toBe("context_overflow");
+    expect(classifyEngineError("out of memory")).toBe("bad_response");
+  });
+
+  it("separates a leading <think> block, across any chunk boundaries", () => {
+    const text = "<think>plan < it</think>\n\nThe answer </think> is <think>literal";
+    for (const size of [1, 2, 3, 5, 7, 100]) {
+      const sp = new ThinkSplitter();
+      const ev: InferenceEvent[] = [];
+      for (let i = 0; i < text.length; i += size) ev.push(...sp.push(text.slice(i, i + size)));
+      ev.push(...sp.flush());
+      const join = (t: string) => ev.filter((e) => e.type === t).map((e) => (e as { text: string }).text).join("");
+      expect(join("reasoning.delta")).toBe("plan < it");
+      expect(join("answer.delta").trim()).toBe("The answer </think> is <think>literal");
+    }
+    const plain = new ThinkSplitter();
+    expect([...plain.push("<th"), ...plain.push("ree")]).toEqual([{ type: "answer.delta", text: "<three" }]);
   });
 });

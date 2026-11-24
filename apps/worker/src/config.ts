@@ -2,11 +2,14 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, w
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { SYSTEM_PROMPT_STYLES } from "@relayllm/provider-adapters";
+import { REASONING_MODES, SYSTEM_PROMPT_STYLES } from "@relayllm/provider-adapters";
 
 export const DEFAULT_RELAYS = ["wss://relay.k1.sv", "wss://nos.lol", "wss://relay.damus.io"];
 /** No default: pairing links must point at a client deployment you control. */
 export const DEFAULT_CLIENT_URL = "";
+
+export const DEFAULT_REQUEST_TIMEOUT_SEC = 1800;
+export const DEFAULT_MAX_TOKENS = 16_384;
 
 const hex64 = z.string().regex(/^[0-9a-f]{64}$/);
 
@@ -31,6 +34,8 @@ export const ConfigSchema = z.object({
     manual: z.array(z.string().min(1).max(256)).default([]),
     /** Per-model override of provider.systemPromptStyle. */
     systemPromptStyle: z.record(z.string().min(1).max(256), z.enum(SYSTEM_PROMPT_STYLES)).default({}),
+    /** Reasoning control for engines that don't advertise one (vLLM, generic). */
+    reasoning: z.record(z.string().min(1).max(256), z.enum(REASONING_MODES)).default({}),
   }),
   relays: z.array(z.string()).min(1),
   clientUrl: z.string().refine((u) => u === "" || /^https?:\/\//.test(u), "must be an http(s) URL").default(DEFAULT_CLIENT_URL),
@@ -53,12 +58,17 @@ export const ConfigSchema = z.object({
       requestsPerMinute: z.number().int().min(1).default(20),
       publicRequestsPerMinute: z.number().int().min(1).default(4),
       publicRequestsPerDay: z.number().int().min(1).default(100),
-      requestTimeoutSec: z.number().int().min(5).default(300),
+      /** Absolute limit for one request, whatever the engine is doing. */
+      requestTimeoutSec: z.number().int().min(5).default(DEFAULT_REQUEST_TIMEOUT_SEC),
+      /** Abort when text was streaming and then nothing arrives for this long. */
+      inactivityTimeoutSec: z.number().int().min(5).default(120),
+      /** Status heartbeat to the client while a request is active. */
+      heartbeatSec: z.number().int().min(2).max(60).default(10),
       maxRequestBytes: z.number().int().min(1000).default(400_000),
       maxMessages: z.number().int().min(1).default(200),
       maxResponseChars: z.number().int().min(100).default(200_000),
-      /** Upper bound applied to max_tokens; also used when the client sends none. */
-      maxTokens: z.number().int().min(1).default(8192),
+      /** Generation budget (reasoning + answer): cap for max_tokens, and its default. */
+      maxTokens: z.number().int().min(1).default(DEFAULT_MAX_TOKENS),
       /** Total size of the client's system instructions. */
       maxSystemPromptChars: z.number().int().min(0).default(32_000),
     })
@@ -116,11 +126,24 @@ export function loadConfig(home = relayllmHome()): Config {
   const p = configPath(home);
   if (!existsSync(p)) throw new Error(`No configuration at ${p}. Run "relayllm init" first.`);
   const raw = JSON.parse(readFileSync(p, "utf8"));
+  migrate(raw);
   const res = ConfigSchema.safeParse(raw);
   if (!res.success) {
     throw new Error(`Invalid configuration in ${p}: ${res.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
   }
   return res.data;
+}
+
+/**
+ * Configs saved before reasoning support spell out the old defaults (300 s,
+ * 8192 tokens), which cut off reasoning models. Raise those exact values once;
+ * anything the owner changed is kept.
+ */
+function migrate(raw: { limits?: Record<string, unknown> }): void {
+  const l = raw?.limits;
+  if (!l || typeof l !== "object" || "inactivityTimeoutSec" in l) return;
+  if (l.requestTimeoutSec === 300) l.requestTimeoutSec = DEFAULT_REQUEST_TIMEOUT_SEC;
+  if (l.maxTokens === 8192) l.maxTokens = DEFAULT_MAX_TOKENS;
 }
 
 /** Atomic write with owner-only permissions. */

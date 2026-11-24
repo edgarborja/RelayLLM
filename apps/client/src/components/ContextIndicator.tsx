@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { HostMetrics, Limits, MetricsResult, ModelMetrics } from "@relayllm/protocol";
 import type { ChatMessageRecord } from "../lib/db.ts";
+import { fmtDuration } from "../lib/generation.ts";
 import { estimateContext, fmtAgo, fmtBytes, fmtCompact, fmtInt, type ContextEstimate } from "../lib/metrics.ts";
 
 /** What the indicator needs from a worker connection. */
@@ -51,6 +52,10 @@ function Bar({ fraction, level }: { fraction: number; level: string }) {
     </div>
   );
 }
+
+const SOURCE = { exact: "exact", provider: "reported by the engine", estimated: "estimated" } as const;
+const counted = (n: number | undefined, src: keyof typeof SOURCE | undefined) => (n === undefined ? null : `${fmtInt(n)}${src ? ` (${SOURCE[src]})` : ""}`);
+const dur = (ms: number | undefined) => (ms === undefined ? null : fmtDuration(ms));
 
 const levelOf = (f: number | null) => (f === null ? "" : f >= 0.95 ? "danger" : f >= 0.8 ? "warn" : "");
 
@@ -194,6 +199,7 @@ export function ContextIndicator(p: ContextIndicatorProps) {
       ? `Context: ~${fmtInt(est.tokens)} of ${fmtInt(ctxWindow!)} tokens`
       : `Context: ~${fmtInt(est.tokens)} tokens (window size unavailable)`;
   const u = est.last;
+  const timing = [...p.messages].reverse().find((m) => m.usage && m.usage === u)?.timing;
 
   return (
     <div className="ctx" ref={ref}>
@@ -219,6 +225,14 @@ export function ContextIndicator(p: ContextIndicatorProps) {
                   ? `${fmtInt(u.promptTokens)} in · ${fmtInt(u.completionTokens ?? 0)} out${u.reasoningTokens ? ` (${fmtInt(u.reasoningTokens)} reasoning)` : ""} · ${u.source ?? "measured"}`
                   : null}
               </Row>
+              {u?.sources && (
+                <>
+                  <Row label="Reasoning tokens">{counted(u.reasoningTokens, u.sources.reasoning)}</Row>
+                  <Row label="Answer tokens">{counted(u.answerTokens, u.sources.answer)}</Row>
+                  <Row label="Generated in total">{counted(u.completionTokens, u.sources.completion)}</Row>
+                  <Row label="Generation budget">{counted(u.maxTokens, u.maxTokens ? "exact" : undefined)}</Row>
+                </>
+              )}
               <Row label="Speed">
                 {u?.tokensPerSecond !== undefined
                   ? `${u.tokensPerSecond.toFixed(1)} tokens/s${u.firstTokenMs !== undefined ? ` · first token ${(u.firstTokenMs / 1000).toFixed(1)} s` : ""}${u.source === "estimated" ? " (estimated)" : ""}`
@@ -226,6 +240,19 @@ export function ContextIndicator(p: ContextIndicatorProps) {
               </Row>
             </dl>
           </section>
+
+          {u?.inferenceMs !== undefined && (
+            <section>
+              <h4>Timing</h4>
+              <dl className="metrics-grid">
+                <Row label="Worker acknowledged">{dur(timing?.ackMs)}</Row>
+                <Row label="First reasoning">{dur(u.firstReasoningMs)}</Row>
+                <Row label="First answer text">{dur(u.firstAnswerMs)}</Row>
+                <Row label="Inference">{dur(u.inferenceMs)}</Row>
+                <Row label="End to end">{dur(timing?.totalMs)}</Row>
+              </dl>
+            </section>
+          )}
 
           <section>
             <h4>Model</h4>

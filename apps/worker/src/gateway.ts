@@ -5,13 +5,16 @@ import {
   SUPPORTED_VERSIONS,
   type ClientMessage,
   type ClientMessageOf,
+  type CountSource,
   type ErrorCode,
+  type FinishDetail,
+  type GenerationState,
   type HostMetrics,
   type ModelInfo,
   type ModelMetrics,
   type WorkerDraft,
 } from "@relayllm/protocol";
-import { ProviderError, type ChatRequest, type ProviderAdapter, type ProviderModel } from "@relayllm/provider-adapters";
+import { type ChatRequest, type InferenceEvent, type ProviderAdapter, type ProviderModel, type ReasoningSetting, type TokenUsage } from "@relayllm/provider-adapters";
 import { hexToNpub, type IncomingMessage } from "@relayllm/nostr-transport";
 import { addPending, authorize, DailyQuota, RateLimiter, redeemInvite, type Authorization } from "./access.ts";
 import type { Config } from "./config.ts";
@@ -51,14 +54,42 @@ interface ActiveStream {
   pendingContent: string;
   pendingReasoning: string;
   lastFlush: number;
+  /** Characters generated so far, by kind. */
+  reasoningChars: number;
+  answerChars: number;
+  state: GenerationState;
+  /** Monotonic times (performance.now). */
+  startedAt: number;
+  lastProgressAt: number | null;
+  firstReasoningAt: number | null;
+  firstAnswerAt: number | null;
+  statusSeq: number;
+  lastStatusAt: number;
+  statusTimer: ReturnType<typeof setTimeout> | null;
+  /** The engine request has ended (its slot is free), even if text is still being published. */
+  inferenceDone: boolean;
+  /** Resolves when the engine request ended; true if its teardown was confirmed. */
+  settled: Promise<boolean>;
+  settle: (confirmed: boolean) => void;
   inFlight: Promise<void> | null;
   flushTimer: ReturnType<typeof setTimeout> | null;
   done: boolean;
   completion?: WorkerDraft;
-  cancelReason?: "cancelled" | "timeout" | "length";
+  cancelReason?: "cancelled" | "timeout" | "length" | "error";
+  detail?: FinishDetail;
   lastResumeAt: number;
   expireTimer?: ReturnType<typeof setTimeout>;
 }
+
+/** Text within this long counts as "active" in status messages. */
+const ACTIVE_MS = 5000;
+/** Minimum spacing of state-change status messages. */
+const STATUS_MIN_MS = 1000;
+/** How long to wait for an aborted engine request to unwind. */
+const TEARDOWN_MS = 3000;
+
+/** Monotonic clock for elapsed times. */
+const mono = () => performance.now();
 
 const short = (pk: string) => `${pk.slice(0, 8)}…`;
 
@@ -76,6 +107,10 @@ export class Gateway {
   /** Metrics requests have their own budget so an open panel never eats into chat limits. */
   readonly #metricsLimiter = new RateLimiter(30, 10);
   readonly #modelInfoCache = new Map<string, { at: number; value: Promise<ModelMetrics | null> }>();
+  readonly #reasoningCache = new Map<string, { at: number; value: Promise<ReasoningSetting[]> }>();
+  /** Cancellations that arrived before their chat.start ("sender:id" → expiry). */
+  readonly #cancelledEarly = new Map<string, number>();
+  readonly #cancelReplyLimiter = new RateLimiter(60, 20);
   #hostCache: { at: number; value: Promise<HostMetrics | null> } | null = null;
 
   constructor(deps: GatewayDeps) {
@@ -87,7 +122,7 @@ export class Gateway {
 
   get activeCount(): number {
     let n = 0;
-    for (const s of this.#streams.values()) if (!s.done) n++;
+    for (const s of this.#streams.values()) if (!s.inferenceDone) n++;
     return n;
   }
 
@@ -95,9 +130,9 @@ export class Gateway {
     return this.#d.now?.() ?? Date.now();
   }
 
-  async #reply(to: string, draft: WorkerDraft): Promise<void> {
+  async #reply(to: string, draft: WorkerDraft, ttlSec?: number): Promise<void> {
     try {
-      await this.#d.send(to, envelope(draft));
+      await this.#d.send(to, envelope(draft, ttlSec ? { ttlSec } : {}));
     } catch (e) {
       this.#d.log.warn("publish failed", { type: draft.type, error: (e as Error).message });
     }
@@ -156,7 +191,7 @@ export class Gateway {
 
     switch (m.type) {
       case "chat.cancel":
-        return this.#cancel(msg.sender, m);
+        return this.#cancel(msg.sender, replyTo, m);
       case "chat.resume":
         return this.#resume(msg.sender, m);
     }
@@ -185,6 +220,9 @@ export class Gateway {
             maxMessages: cfg.limits.maxMessages,
             requestTimeoutSec: cfg.limits.requestTimeoutSec,
             maxSystemPromptChars: cfg.limits.maxSystemPromptChars,
+            heartbeatSec: cfg.limits.heartbeatSec,
+            inactivityTimeoutSec: cfg.limits.inactivityTimeoutSec,
+            maxTokens: cfg.limits.maxTokens,
           },
         });
       case "models.list":
@@ -308,14 +346,31 @@ export class Gateway {
     }
     const discovered = new Map((this.#modelCache.models ?? []).map((m) => [m.id, m]));
     const caps = this.#d.provider.capabilities;
-    return cfg.models.exposed
-      .filter((id) => discovered.has(id) || cfg.models.manual.includes(id) || this.#modelCache.models === null)
-      .map((id) => ({
+    const ids = cfg.models.exposed.filter((id) => discovered.has(id) || cfg.models.manual.includes(id) || this.#modelCache.models === null);
+    return Promise.all(
+      ids.map(async (id) => ({
         id,
         contextLength: discovered.get(id)?.contextLength,
         streaming: caps.streaming,
         cancel: caps.cancel,
-      }));
+        reasoningOptions: await this.reasoningOptions(id),
+      })),
+    );
+  }
+
+  /** Reasoning settings the engine (or the owner's config) declares for a model. */
+  reasoningOptions(id: string): Promise<ReasoningSetting[]> {
+    const mode = this.#d.getConfig().models.reasoning[id];
+    const key = `${mode ?? ""}:${id}`;
+    const hit = this.#reasoningCache.get(key);
+    if (hit && this.#now() - hit.at < 60_000) return hit.value;
+    const value = this.#d.provider.reasoningOptions(id, mode).catch(() => {
+      this.#reasoningCache.delete(key); // engine unreachable: ask again next time
+      return [];
+    });
+    if (this.#reasoningCache.size > 200) this.#reasoningCache.clear();
+    this.#reasoningCache.set(key, { at: this.#now(), value });
+    return value;
   }
 
   async #chat(sender: string, replyTo: string, m: ClientMessageOf<"chat.start">): Promise<void> {
@@ -325,6 +380,10 @@ export class Gateway {
       // Duplicate start (client retry): acknowledge again, don't re-run.
       if (existing.sender === sender) await this.#reply(existing.replyTo, { type: "chat.ack", re: m.id, model: existing.model });
       return;
+    }
+    if (this.#takeEarlyCancel(sender, m.id)) {
+      // Its cancellation overtook it on the way here.
+      return this.#reply(replyTo, { type: "chat.complete", re: m.id, deltaCount: 0, finishReason: "cancelled", contentLength: 0 });
     }
     if (m.messages.length > cfg.limits.maxMessages) return this.#error(replyTo, "too_large", m.id, { message: "Too many messages in conversation." });
     if (!cfg.models.exposed.includes(m.model)) return this.#error(replyTo, "model_unavailable", m.id);
@@ -340,12 +399,21 @@ export class Gateway {
       return this.#error(replyTo, "too_large", m.id, { message: "The system prompt is longer than this worker allows." });
     }
 
-    const active = [...this.#streams.values()].filter((s) => !s.done);
+    const wanted = m.params?.reasoning;
+    if (wanted && !(await this.reasoningOptions(m.model)).includes(wanted)) {
+      return this.#error(replyTo, "invalid_request", m.id, { message: "This model doesn't support that reasoning setting." });
+    }
+    // A duplicate of this start may have been accepted while we waited.
+    if (this.#streams.has(m.id)) return;
+
+    const active = [...this.#streams.values()].filter((s) => !s.inferenceDone);
     if (active.length >= cfg.limits.maxConcurrent) return this.#error(replyTo, "busy", m.id, { retryAfter: 5 });
     if (active.filter((s) => s.sender === sender).length >= cfg.limits.perUserConcurrent) {
       return this.#error(replyTo, "busy", m.id, { retryAfter: 2, message: "You already have a response in progress." });
     }
 
+    let settle!: (confirmed: boolean) => void;
+    const settled = new Promise<boolean>((r) => (settle = r));
     const s: ActiveStream = {
       id: m.id,
       sender,
@@ -357,7 +425,20 @@ export class Gateway {
       totalChars: 0,
       pendingContent: "",
       pendingReasoning: "",
-      lastFlush: this.#now(),
+      lastFlush: mono(),
+      reasoningChars: 0,
+      answerChars: 0,
+      state: "prompt",
+      startedAt: mono(),
+      lastProgressAt: null,
+      firstReasoningAt: null,
+      firstAnswerAt: null,
+      statusSeq: 0,
+      lastStatusAt: -Infinity,
+      statusTimer: null,
+      inferenceDone: false,
+      settled,
+      settle,
       inFlight: null,
       flushTimer: null,
       done: false,
@@ -366,79 +447,151 @@ export class Gateway {
     this.#streams.set(m.id, s);
     this.#d.log.info("chat started", { req: m.id.slice(0, 8), user: short(sender), model: m.model, messages: m.messages.length });
 
-    const timeout = setTimeout(() => {
-      s.cancelReason = "timeout";
+    const abort = (reason: NonNullable<ActiveStream["cancelReason"]>, detail?: FinishDetail) => {
+      if (s.cancelReason || s.inferenceDone) return;
+      s.cancelReason = reason;
+      s.detail = detail;
       s.controller.abort();
-    }, cfg.limits.requestTimeoutSec * 1000);
-
-    await this.#reply(replyTo, { type: "chat.ack", re: m.id, model: m.model });
-
-    const req: ChatRequest = {
-      model: m.model,
-      messages: m.messages,
-      temperature: m.params?.temperature,
-      top_p: m.params?.top_p,
-      max_tokens: Math.min(m.params?.max_tokens ?? cfg.limits.maxTokens, cfg.limits.maxTokens),
-      systemPromptStyle: cfg.models.systemPromptStyle[m.model] ?? cfg.provider.systemPromptStyle,
     };
+    const timeout = setTimeout(() => abort("timeout", "absolute_timeout"), cfg.limits.requestTimeoutSec * 1000);
+    const tick = Math.min(1000, cfg.limits.heartbeatSec * 250, cfg.limits.inactivityTimeoutSec * 250);
+    const monitor = setInterval(() => {
+      const now = mono();
+      // Only a pause after text was flowing is a confirmed stall. An engine
+      // that has shown nothing yet may be loading, reading the prompt, or
+      // reasoning without exposing it: that is bounded by the absolute timeout.
+      if (s.lastProgressAt !== null && now - s.lastProgressAt > cfg.limits.inactivityTimeoutSec * 1000) return abort("timeout", "inactivity");
+      if (now - s.lastStatusAt >= cfg.limits.heartbeatSec * 1000) this.#sendStatus(s);
+    }, tick);
 
-    let finishReason: "stop" | "length" | "cancelled" | "error" | "timeout" = "stop";
+    let end: { finishReason: "stop" | "length"; usage?: TokenUsage } | undefined;
+    let usage: TokenUsage | undefined;
+    let failure: Extract<InferenceEvent, { type: "generation.error" }> | undefined;
     let errorCode: ErrorCode | undefined;
-    let usage: { promptTokens?: number; completionTokens?: number; reasoningTokens?: number } | undefined;
-    const startedAt = this.#now();
-    let firstTokenAt: number | undefined;
+    let confirmed = true;
+    let contextWindow: number | undefined;
+    let budget = Math.min(m.params?.max_tokens ?? cfg.limits.maxTokens, cfg.limits.maxTokens);
+    let clamped = false;
+    let inferenceStart = mono();
+    let inferenceEnd = inferenceStart;
     try {
-      for await (const chunk of this.#d.provider.chat(req, s.controller.signal)) {
-        if (chunk.type === "done") {
-          finishReason = chunk.finishReason === "error" ? "error" : chunk.finishReason;
-          usage = chunk.usage;
-          break;
+      await this.#reply(replyTo, { type: "chat.ack", re: m.id, model: m.model });
+
+      // Load state and window, without holding up the request if the engine is slow to answer.
+      const info = await Promise.race([this.modelMetrics(m.model), sleep(1500).then(() => null)]);
+      if (info?.state === "not-loaded") s.state = "loading";
+      contextWindow = info?.state === "not-loaded" ? undefined : (info?.loadedContext ?? undefined);
+      if (contextWindow) {
+        // The budget has to fit beside the prompt (some engines reject the request
+        // otherwise). Generous prompt estimate: ~3 characters per token.
+        const prompt = m.messages.reduce((n, x) => n + 8 + Math.ceil(x.content.length / 3), 0);
+        const room = Math.max(256, contextWindow - prompt - 64);
+        if (room < budget) {
+          budget = room;
+          clamped = true;
         }
-        firstTokenAt ??= this.#now();
-        if (chunk.type === "content") {
-          s.pendingContent += chunk.text;
-          s.contentLength += chunk.text.length;
-        } else {
-          s.pendingReasoning += chunk.text;
+      }
+      this.#sendStatus(s);
+
+      const req: ChatRequest = {
+        model: m.model,
+        messages: m.messages,
+        temperature: m.params?.temperature,
+        top_p: m.params?.top_p,
+        max_tokens: budget,
+        systemPromptStyle: cfg.models.systemPromptStyle[m.model] ?? cfg.provider.systemPromptStyle,
+        reasoning: m.params?.reasoning,
+        reasoningMode: cfg.models.reasoning[m.model],
+      };
+      inferenceStart = mono();
+      const signal = s.controller.signal;
+      const aborted = new Promise<"aborted">((r) => {
+        if (signal.aborted) r("aborted");
+        else signal.addEventListener("abort", () => r("aborted"), { once: true });
+      });
+      if (!signal.aborted) {
+        const it = this.#d.provider.chat(req, signal)[Symbol.asyncIterator]();
+        for (;;) {
+          const next = it.next();
+          const r = await Promise.race([next, aborted]);
+          if (r === "aborted") {
+            // Don't depend on the engine reacting: wait briefly for its teardown.
+            const unwound = next.then(() => it.return?.(), () => undefined).then(() => true, () => true);
+            confirmed = await Promise.race([unwound, sleep(TEARDOWN_MS).then(() => false)]);
+            break;
+          }
+          if (r.done) break;
+          const ev = r.value;
+          if (ev.type === "usage.update") usage = ev.usage;
+          else if (ev.type === "generation.complete") end = ev;
+          else if (ev.type === "generation.error") failure = ev;
+          else {
+            this.#onText(s, ev, cfg);
+            if (s.totalChars > cfg.limits.maxResponseChars) abort("length", "response_size");
+          }
         }
-        s.totalChars += chunk.text.length;
-        if (s.totalChars > cfg.limits.maxResponseChars) {
-          s.cancelReason = "length";
-          s.controller.abort();
-          break;
-        }
-        this.#maybeFlush(s, cfg);
       }
     } catch (e) {
-      if (s.cancelReason) {
-        /* handled below */
-      } else if (e instanceof ProviderError) {
-        finishReason = "error";
-        errorCode = e.code === "unavailable" ? "provider_unavailable" : "provider_error";
-        this.#d.log.warn("provider error", { req: m.id.slice(0, 8), error: e.message });
-      } else {
-        finishReason = "error";
+      if (!s.cancelReason) {
+        s.cancelReason = "error";
         errorCode = "internal";
         this.#d.log.error("chat failed", { req: m.id.slice(0, 8), error: (e as Error).message });
       }
     } finally {
+      inferenceEnd = mono();
       clearTimeout(timeout);
+      clearInterval(monitor);
+      s.inferenceDone = true; // frees the concurrency slot
+      s.settle(confirmed);
     }
-    if (s.cancelReason) {
-      finishReason = s.cancelReason === "length" ? "length" : s.cancelReason;
-      if (s.cancelReason === "timeout") errorCode = "timeout";
-    }
-    const finalUsage = completeUsage(usage, m.messages, s.totalChars, startedAt, firstTokenAt, this.#now());
 
-    // Final flush, then completion.
+    let finishReason: "stop" | "length" | "cancelled" | "error" | "timeout";
+    if (s.cancelReason) {
+      finishReason = s.cancelReason;
+      if (s.cancelReason === "timeout") errorCode = "timeout";
+    } else if (failure || !end) {
+      finishReason = "error";
+      errorCode =
+        failure?.kind === "unavailable" ? "provider_unavailable" : failure?.kind === "context_overflow" ? "too_large" : failure?.kind === "unsupported" ? "invalid_request" : "provider_error";
+      if (failure?.kind === "context_overflow") s.detail = "context_full";
+      else if (!failure || failure.detail === "stream ended early" || failure.detail === "stream interrupted") s.detail = "stream_ended";
+      this.#d.log.warn("provider error", { req: m.id.slice(0, 8), kind: failure?.kind, error: failure?.detail });
+    } else {
+      finishReason = end.finishReason;
+      usage = end.usage ?? usage;
+    }
+    const finalUsage = completeUsage({
+      reported: usage,
+      messages: m.messages,
+      reasoningChars: s.reasoningChars,
+      answerChars: s.answerChars,
+      startedAt: inferenceStart,
+      firstReasoningAt: s.firstReasoningAt,
+      firstAnswerAt: s.firstAnswerAt,
+      endedAt: inferenceEnd,
+    });
+    if (finishReason === "length" && !s.detail) {
+      const measured = finalUsage.source === "measured";
+      if (clamped || (measured && contextWindow && finalUsage.promptTokens + finalUsage.completionTokens >= contextWindow - 16)) s.detail = "context_full";
+      else if (measured && finalUsage.completionTokens < budget * 0.9) s.detail = "engine_limit";
+      else s.detail = "token_budget";
+    }
+
+    // Publish what's left, then the completion. After a cancel the client has
+    // stopped listening, so unpublished text is dropped.
+    this.#setState(s, "finishing");
+    if (s.cancelReason === "cancelled") {
+      s.contentLength -= s.pendingContent.length;
+      s.pendingContent = s.pendingReasoning = "";
+    }
     while (s.inFlight || s.pendingContent || s.pendingReasoning) {
       if (s.flushTimer) clearTimeout(s.flushTimer);
       s.flushTimer = null;
       if (s.inFlight) await s.inFlight;
       else await this.#flush(s);
     }
-    if (s.flushTimer) clearTimeout(s.flushTimer);
-    s.flushTimer = null;
+    for (const t of [s.flushTimer, s.statusTimer]) if (t) clearTimeout(t);
+    s.flushTimer = s.statusTimer = null;
     s.done = true;
     s.completion = {
       type: "chat.complete",
@@ -447,13 +600,76 @@ export class Gateway {
       finishReason,
       errorCode,
       contentLength: s.contentLength,
-      usage: finalUsage,
+      usage: { ...finalUsage, maxTokens: budget, contextWindow, detail: s.detail },
     };
     await this.#reply(s.replyTo, s.completion);
-    this.#d.log.info("chat finished", { req: m.id.slice(0, 8), finishReason, deltas: s.deltas.length, chars: s.totalChars });
+    this.#d.log.info("chat finished", {
+      req: m.id.slice(0, 8),
+      finishReason,
+      detail: s.detail,
+      sec: Math.round((inferenceEnd - inferenceStart) / 1000),
+      deltas: s.deltas.length,
+      chars: s.totalChars,
+    });
     // Keep the transcript briefly so clients can recover lost chunks.
     s.expireTimer = setTimeout(() => this.#streams.delete(s.id), cfg.streaming.resumeBufferSec * 1000);
     s.expireTimer.unref?.();
+  }
+
+  #onText(s: ActiveStream, ev: Extract<InferenceEvent, { text: string }>, cfg: Config): void {
+    const now = mono();
+    s.lastProgressAt = now;
+    s.totalChars += ev.text.length;
+    if (ev.type === "answer.delta") {
+      s.firstAnswerAt ??= now;
+      s.pendingContent += ev.text;
+      s.contentLength += ev.text.length;
+      s.answerChars += ev.text.length;
+      this.#setState(s, "answering");
+    } else {
+      s.firstReasoningAt ??= now;
+      s.pendingReasoning += ev.text;
+      s.reasoningChars += ev.text.length;
+      this.#setState(s, "thinking");
+    }
+    this.#maybeFlush(s, cfg);
+  }
+
+  /** State changes are reported promptly, at most once per STATUS_MIN_MS. */
+  #setState(s: ActiveStream, state: GenerationState): void {
+    if (s.state === state) return;
+    s.state = state;
+    if (s.statusTimer) return;
+    const wait = s.lastStatusAt + STATUS_MIN_MS - mono();
+    if (wait <= 0) return this.#sendStatus(s);
+    s.statusTimer = setTimeout(() => {
+      s.statusTimer = null;
+      this.#sendStatus(s);
+    }, wait);
+  }
+
+  /** Heartbeat and live statistics. Never counts as inference progress. */
+  #sendStatus(s: ActiveStream): void {
+    if (s.done) return;
+    const now = mono();
+    s.lastStatusAt = now;
+    const since = s.lastProgressAt === null ? null : Math.round(now - s.lastProgressAt);
+    const first = Math.min(s.firstReasoningAt ?? Infinity, s.firstAnswerAt ?? Infinity);
+    const tokens = estimateTokens(s.totalChars);
+    const draft: WorkerDraft = {
+      type: "chat.status",
+      re: s.id,
+      n: s.statusSeq++,
+      state: s.state,
+      progress: since === null ? "unknown" : since < ACTIVE_MS ? "active" : "quiet",
+      elapsedMs: Math.round(now - s.startedAt),
+      sinceProgressMs: since,
+      deltaCount: s.deltas.length,
+      reasoningTokens: s.reasoningChars ? estimateTokens(s.reasoningChars) : null,
+      answerTokens: s.answerChars ? estimateTokens(s.answerChars) : null,
+      tokensPerSecond: now - first >= 1000 ? Math.round((tokens / ((now - first) / 1000)) * 10) / 10 : null,
+    };
+    void this.#reply(s.replyTo, draft, 30);
   }
 
   /** Batch by time or size; at most one publish in flight per stream. */
@@ -461,7 +677,7 @@ export class Gateway {
     if (s.inFlight) return; // backpressure: text keeps coalescing
     const pending = s.pendingContent.length + s.pendingReasoning.length;
     if (pending === 0) return;
-    const elapsed = this.#now() - s.lastFlush;
+    const elapsed = mono() - s.lastFlush;
     if (elapsed >= cfg.streaming.batchMs || pending >= cfg.streaming.maxBatchChars) {
       void this.#flush(s);
     } else if (!s.flushTimer) {
@@ -484,7 +700,7 @@ export class Gateway {
     if (content) delta.content = content;
     if (reasoning) delta.reasoning = reasoning;
     s.deltas.push(delta);
-    s.lastFlush = this.#now();
+    s.lastFlush = mono();
     const p = this.#reply(s.replyTo, { type: "chat.delta", re: s.id, ...delta }).then(async () => {
       s.inFlight = null;
       if (s.pendingContent.length + s.pendingReasoning.length >= max) await this.#flush(s);
@@ -494,14 +710,32 @@ export class Gateway {
     return p;
   }
 
-  async #cancel(sender: string, m: ClientMessageOf<"chat.cancel">): Promise<void> {
+  /** Cancel the sender's own request. Safe to repeat; always answered. */
+  async #cancel(sender: string, replyTo: string, m: ClientMessageOf<"chat.cancel">): Promise<void> {
     const s = this.#streams.get(m.target);
-    if (!s || s.sender !== sender) return; // don't reveal other users' requests
-    if (!s.done && !s.cancelReason) {
-      s.cancelReason = "cancelled";
-      s.controller.abort();
-      this.#d.log.info("chat cancelled", { req: m.target.slice(0, 8) });
+    let status: "cancelled" | "finished" | "not_found" | "unconfirmed";
+    if (!s || s.sender !== sender) {
+      // Never reveals other users' requests. Remember it in case the start is still on its way.
+      const now = this.#now();
+      for (const [k, until] of this.#cancelledEarly) if (until < now || this.#cancelledEarly.size > 1000) this.#cancelledEarly.delete(k);
+      this.#cancelledEarly.set(`${sender}:${m.target}`, now + 300_000);
+      status = "not_found";
+    } else {
+      if (!s.inferenceDone && !s.cancelReason) {
+        s.cancelReason = "cancelled";
+        s.controller.abort();
+        this.#d.log.info("chat cancelled", { req: m.target.slice(0, 8) });
+      }
+      const confirmed = await Promise.race([s.settled, sleep(TEARDOWN_MS + 2000).then(() => false)]);
+      status = s.cancelReason !== "cancelled" ? "finished" : confirmed ? "cancelled" : "unconfirmed";
     }
+    if (this.#cancelReplyLimiter.take(sender, this.#now()) > 0) return;
+    await this.#reply(replyTo, { type: "chat.cancel.result", re: m.id, target: m.target, status });
+  }
+
+  #takeEarlyCancel(sender: string, id: string): boolean {
+    const until = this.#cancelledEarly.get(`${sender}:${id}`);
+    return until !== undefined && until >= this.#now();
   }
 
   async #resume(sender: string, m: ClientMessageOf<"chat.resume">): Promise<void> {
@@ -524,10 +758,12 @@ export class Gateway {
   /** Abort everything (shutdown). */
   shutdown(): void {
     for (const s of this.#streams.values()) {
-      if (!s.done) {
-        s.cancelReason = "cancelled";
+      if (!s.inferenceDone && !s.cancelReason) {
+        s.cancelReason = "error";
+        s.detail = "worker_shutdown";
         s.controller.abort();
       }
+      if (s.statusTimer) clearTimeout(s.statusTimer);
       if (s.expireTimer) clearTimeout(s.expireTimer);
       if (s.flushTimer) clearTimeout(s.flushTimer);
     }
@@ -538,35 +774,77 @@ export class Gateway {
 export const estimateTokens = (chars: number) => Math.ceil(chars / 4);
 
 /**
- * Token counts for chat.complete: the engine's when it reports them
- * ("measured"), otherwise estimated from text length ("estimated"), plus
- * timing measured by the worker around the engine stream.
+ * Token counts for chat.complete: the engine's when it reports them, otherwise
+ * estimated from text length, each marked with its source. Durations come
+ * from the worker's monotonic clock.
  */
-export function completeUsage(
-  reported: { promptTokens?: number; completionTokens?: number; reasoningTokens?: number } | undefined,
-  messages: readonly { content: string }[],
-  outputChars: number,
-  startedAt: number,
-  firstTokenAt: number | undefined,
-  endedAt: number,
-) {
-  const measured = reported?.promptTokens !== undefined && reported?.completionTokens !== undefined;
-  const promptTokens = reported?.promptTokens ?? messages.reduce((n, x) => n + 4 + estimateTokens(x.content.length), 0);
-  const completionTokens = reported?.completionTokens ?? estimateTokens(outputChars);
-  const generationMs = firstTokenAt !== undefined ? Math.max(0, endedAt - firstTokenAt) : undefined;
+export function completeUsage(o: {
+  reported?: TokenUsage;
+  messages: readonly { content: string }[];
+  reasoningChars: number;
+  answerChars: number;
+  startedAt: number;
+  firstReasoningAt: number | null;
+  firstAnswerAt: number | null;
+  endedAt: number;
+}) {
+  const r = o.reported;
+  const chars = o.reasoningChars + o.answerChars;
+  const promptTokens = r?.promptTokens ?? o.messages.reduce((n, x) => n + 4 + estimateTokens(x.content.length), 0);
+  let completionTokens = r?.completionTokens ?? estimateTokens(chars);
+  let reasoningTokens = r?.reasoningTokens;
+  let answerTokens: number;
+  let reasoningSource: CountSource | undefined = reasoningTokens !== undefined ? "provider" : undefined;
+  let answerSource: CountSource = "estimated";
+  if (reasoningTokens !== undefined && r?.completionTokens !== undefined) {
+    if (reasoningTokens > r.completionTokens) {
+      // This engine counts reasoning separately from completion tokens.
+      answerTokens = r.completionTokens;
+      completionTokens = r.completionTokens + reasoningTokens;
+    } else {
+      answerTokens = r.completionTokens - reasoningTokens; // included: don't count it twice
+    }
+    answerSource = "provider";
+  } else if (o.reasoningChars > 0) {
+    // Reasoning was visible but not counted separately: split by text length.
+    reasoningTokens ??= Math.round((completionTokens * o.reasoningChars) / chars);
+    reasoningSource ??= "estimated";
+    answerTokens = Math.max(0, completionTokens - reasoningTokens);
+  } else {
+    // No reasoning exposed. It may have been hidden, so the split is unknown.
+    answerTokens = Math.min(completionTokens, Math.max(estimateTokens(o.answerChars), o.answerChars ? 1 : 0));
+  }
+  const ms = (t: number | null) => (t === null ? undefined : Math.max(0, Math.round(t - o.startedAt)));
+  const firstReasoningMs = ms(o.firstReasoningAt);
+  const firstAnswerMs = ms(o.firstAnswerAt);
+  const firstTokenMs = firstReasoningMs === undefined ? firstAnswerMs : Math.min(firstReasoningMs, firstAnswerMs ?? Infinity);
+  const inferenceMs = Math.max(0, Math.round(o.endedAt - o.startedAt));
+  const generationMs = firstTokenMs === undefined ? undefined : Math.max(0, inferenceMs - firstTokenMs);
   return {
     promptTokens,
     completionTokens,
-    reasoningTokens: reported?.reasoningTokens,
-    source: measured ? ("measured" as const) : ("estimated" as const),
-    firstTokenMs: firstTokenAt !== undefined ? Math.max(0, firstTokenAt - startedAt) : undefined,
+    reasoningTokens,
+    answerTokens,
+    source: r?.promptTokens !== undefined && r?.completionTokens !== undefined ? ("measured" as const) : ("estimated" as const),
+    sources: {
+      prompt: (r?.promptTokens !== undefined ? "provider" : "estimated") as CountSource,
+      completion: (r?.completionTokens !== undefined ? "provider" : "estimated") as CountSource,
+      reasoning: reasoningSource,
+      answer: answerSource,
+    },
+    firstTokenMs,
+    firstReasoningMs,
+    firstAnswerMs,
     generationMs,
+    inferenceMs,
     tokensPerSecond:
       generationMs !== undefined && generationMs >= 50 && completionTokens > 0
         ? Math.round((completionTokens / (generationMs / 1000)) * 10) / 10
         : undefined,
   };
 }
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref?.());
 
 function replyToOf(payload: unknown): string | undefined {
   const r = (payload as { replyTo?: unknown } | null)?.replyTo;

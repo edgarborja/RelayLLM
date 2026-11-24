@@ -5,6 +5,7 @@ import {
   parseWorkerMessage,
   type ChatMessage,
   type ChatParams,
+  type ChatStatus,
   type ClientDraft,
   type ErrorCode,
   type ModelInfo,
@@ -79,7 +80,15 @@ export class StreamAssembler {
 export interface ChatCallbacks {
   onAck?: () => void;
   onUpdate?: (state: { content: string; reasoning: string }) => void;
+  /** Worker heartbeat and live statistics. */
+  onStatus?: (status: ChatStatus) => void;
 }
+
+/**
+ * confirmed: the worker stopped the request; finished: it had already ended or
+ * isn't running; unconfirmed: the worker didn't (or couldn't) confirm.
+ */
+export type CancelOutcome = "confirmed" | "finished" | "unconfirmed";
 
 export interface ChatResult {
   content: string;
@@ -89,11 +98,17 @@ export interface ChatResult {
   usage?: WorkerMessageOf<"chat.complete">["usage"];
   /** True if chunks were still missing when we gave up on recovery. */
   incomplete: boolean;
+  /** Client-side durations (monotonic). */
+  timing: { ackMs?: number; totalMs: number };
 }
 
 export interface ChatHandle {
   id: string;
-  cancel(): Promise<void>;
+  /**
+   * Stop now: `result` resolves immediately with the partial text and later
+   * chunks are ignored. Resolves once the worker confirms, or can't.
+   */
+  cancel(): Promise<CancelOutcome>;
   result: Promise<ChatResult>;
 }
 
@@ -111,7 +126,13 @@ interface ActiveChat {
   resolve: (r: ChatResult) => void;
   reject: (e: Error) => void;
   startedAt: number;
+  ackMs?: number;
   acked: boolean;
+  /** Last status number seen; -1 until the worker sends heartbeats. */
+  statusN: number;
+  /** Last message of any kind from the worker about this chat. */
+  lastContactAt: number;
+  resumeIds: Set<string>;
   startResent: boolean;
   startMsg: object;
   lastEventAt: number;
@@ -129,8 +150,15 @@ export interface WorkerClientOptions {
   /** Per-session key for receiving responses. Generated if omitted. */
   session?: Signer;
   requestTimeoutMs?: number;
-  /** Max time to wait for a chat to complete. */
+  /**
+   * Safety net for a chat whose worker never reports an end. The worker
+   * enforces the real limit; this must be longer.
+   */
   chatTimeoutMs?: number;
+  /** With relays connected and a worker known to send heartbeats: silence before giving up. */
+  lostContactMs?: number;
+  /** Wait for a cancellation to be confirmed, per attempt (3 attempts). */
+  cancelTimeoutMs?: number;
   /** Gap/stall duration before asking the worker to re-send. */
   resumeAfterMs?: number;
 }
@@ -143,12 +171,16 @@ export class WorkerClient {
   readonly #endpoint: NostrEndpoint;
   readonly #pending = new Map<string, PendingRequest>();
   readonly #chats = new Map<string, ActiveChat>();
+  readonly #cancels = new Map<string, { promise: Promise<CancelOutcome>; resolve: (o: CancelOutcome) => void }>();
   #wasConnected = false;
+  #onlineSince = performance.now();
 
   constructor(opts: WorkerClientOptions) {
     this.#o = {
       requestTimeoutMs: 15_000,
-      chatTimeoutMs: 330_000,
+      chatTimeoutMs: 1_890_000,
+      lostContactMs: 180_000,
+      cancelTimeoutMs: 6000,
       resumeAfterMs: 2500,
       ...opts,
       session: opts.session ?? new LocalSigner(generateSecretKey()),
@@ -193,12 +225,14 @@ export class WorkerClient {
       c.reject(new RemoteError("no_response", "Client stopped"));
     }
     this.#chats.clear();
+    for (const c of this.#cancels.values()) c.resolve("unconfirmed");
   }
 
   /** Call when relay connectivity changes; resumes in-flight streams. */
   onConnectivity(connected: boolean): void {
     if (connected && !this.#wasConnected) {
-      for (const c of this.#chats.values()) void this.#resume(c, c.asm.nextSeq);
+      this.#onlineSince = performance.now();
+      for (const c of this.#chats.values()) if (c.acked) void this.#resume(c, c.asm.nextSeq);
     }
     this.#wasConnected = connected;
   }
@@ -255,7 +289,7 @@ export class WorkerClient {
     return (await this.#request({ type: "pair.request", token, label }, "pair.result")).status;
   }
 
-  chat(req: { model: string; messages: ChatMessage[]; params?: ChatParams }, callbacks: ChatCallbacks = {}): ChatHandle {
+  chat(req: { model: string; messages: ChatMessage[]; params?: ChatParams }, callbacks: ChatCallbacks = {}, opts: { timeoutMs?: number } = {}): ChatHandle {
     const draft: ClientDraft = { type: "chat.start", model: req.model, messages: req.messages, params: req.params };
     const msg = envelope({ ...draft, replyTo: this.#o.session.pubkey } as ClientDraft);
     const id = msg.id;
@@ -266,14 +300,17 @@ export class WorkerClient {
         callbacks,
         resolve,
         reject,
-        startedAt: Date.now(),
+        startedAt: performance.now(),
         acked: false,
+        statusN: -1,
+        lastContactAt: performance.now(),
+        resumeIds: new Set(),
         startResent: false,
         startMsg: msg,
-        lastEventAt: Date.now(),
+        lastEventAt: performance.now(),
         gapAttempts: 0,
         gapSince: null,
-        deadline: Date.now() + this.#o.chatTimeoutMs,
+        deadline: performance.now() + (opts.timeoutMs ?? this.#o.chatTimeoutMs),
         watchdog: setInterval(() => this.#watch(chat), 500),
       };
       this.#chats.set(id, chat);
@@ -284,11 +321,45 @@ export class WorkerClient {
     return {
       id,
       result,
-      cancel: async () => {
-        if (!this.#chats.has(id)) return;
-        await this.#send({ type: "chat.cancel", target: id }).catch(() => undefined);
+      cancel: () => {
+        const c = this.#chats.get(id);
+        if (c) {
+          clearInterval(c.watchdog);
+          this.#chats.delete(id); // later chunks for this id are ignored
+          c.resolve({
+            content: c.asm.content,
+            reasoning: c.asm.reasoning,
+            finishReason: "cancelled",
+            incomplete: false,
+            timing: { ackMs: c.ackMs, totalMs: Math.round(performance.now() - c.startedAt) },
+          });
+        } else if (!this.#cancels.has(id)) return Promise.resolve("finished");
+        return this.cancelRequest(id);
       },
     };
+  }
+
+  /** Ask the worker to stop a request by id. Repeat calls share one attempt. */
+  cancelRequest(id: string): Promise<CancelOutcome> {
+    const existing = this.#cancels.get(id);
+    if (existing) return existing.promise;
+    let resolve!: (o: CancelOutcome) => void;
+    const promise = new Promise<CancelOutcome>((r) => (resolve = r));
+    this.#cancels.set(id, { promise, resolve });
+    let attempts = 0;
+    const attempt = () => {
+      if (attempts++ >= 3) return resolve("unconfirmed");
+      void this.#send({ type: "chat.cancel", target: id }).catch(() => undefined);
+      timer = setTimeout(attempt, this.#o.cancelTimeoutMs);
+    };
+    let timer: ReturnType<typeof setTimeout>;
+    attempt();
+    void promise.then(() => {
+      clearTimeout(timer);
+      // Keep the outcome a little while so repeated Stop presses see it.
+      setTimeout(() => this.#cancels.delete(id), 30_000);
+    });
+    return promise;
   }
 
   #finishWithError(id: string, err: Error): void {
@@ -300,9 +371,10 @@ export class WorkerClient {
   }
 
   #watch(c: ActiveChat): void {
-    const now = Date.now();
+    const now = performance.now();
     if (now > c.deadline) {
-      this.#finishWithError(c.id, new RemoteError("timeout", "Timed out waiting for the response."));
+      this.#finishWithError(c.id, new RemoteError("timeout", "The worker never reported the end of this response."));
+      void this.cancelRequest(c.id);
       return;
     }
     if (!c.acked) {
@@ -316,7 +388,16 @@ export class WorkerClient {
           c.id,
           new RemoteError("no_response", "The worker did not respond. It may be offline or unreachable via these relays."),
         );
+        void this.cancelRequest(c.id); // in case the request arrives late
       }
+      return;
+    }
+    // Worker silence, with working relays. Inference progress plays no part:
+    // a live worker sends heartbeats however long the model thinks.
+    const silentFor = now - Math.max(c.lastContactAt, this.#onlineSince);
+    if (c.statusN >= 0 && this.#o.pool.connectedCount > 0 && silentFor > this.#o.lostContactMs) {
+      this.#finishWithError(c.id, new RemoteError("no_response", "Lost contact with the worker. The text received so far was kept."));
+      void this.cancelRequest(c.id);
       return;
     }
     const gapStuck = c.gapSince !== null && now - c.gapSince > this.#o.resumeAfterMs;
@@ -340,9 +421,11 @@ export class WorkerClient {
   }
 
   async #resume(c: ActiveChat, fromSeq?: number, missing?: number[]): Promise<void> {
-    await this.#send(missing ? { type: "chat.resume", target: c.id, missing } : { type: "chat.resume", target: c.id, fromSeq: fromSeq ?? 0 }).catch(
-      () => undefined,
-    );
+    const draft: ClientDraft = missing ? { type: "chat.resume", target: c.id, missing } : { type: "chat.resume", target: c.id, fromSeq: fromSeq ?? 0 };
+    const msg = envelope({ ...draft, replyTo: this.#o.session.pubkey } as ClientDraft);
+    c.resumeIds.add(msg.id);
+    if (c.resumeIds.size > 50) c.resumeIds.delete(c.resumeIds.values().next().value!);
+    await this.#endpoint.send(this.#o.workerPubkey, msg).catch(() => undefined);
   }
 
   #finalize(c: ActiveChat, incomplete = false): void {
@@ -357,32 +440,58 @@ export class WorkerClient {
       usage: done.usage,
       // Integrity: the reassembled text must match what the worker generated.
       incomplete: incomplete || c.asm.content.length !== done.contentLength,
+      timing: { ackMs: c.ackMs, totalMs: Math.round(performance.now() - c.startedAt) },
     });
   }
 
   #onMessage(m: WorkerMessage): void {
-    if (m.type === "chat.ack" || m.type === "chat.delta" || m.type === "chat.complete") {
+    if (m.type === "chat.cancel.result") {
+      this.#cancels.get(m.target)?.resolve(m.status === "cancelled" ? "confirmed" : m.status === "unconfirmed" ? "unconfirmed" : "finished");
+      return;
+    }
+    // A completion also confirms a cancellation (workers without chat.cancel.result).
+    if (m.type === "chat.complete") this.#cancels.get(m.re)?.resolve(m.finishReason === "cancelled" ? "confirmed" : "finished");
+    if (m.type === "chat.ack" || m.type === "chat.delta" || m.type === "chat.complete" || m.type === "chat.status") {
       const c = this.#chats.get(m.re);
       if (!c) return;
-      c.lastEventAt = Date.now();
+      c.lastEventAt = c.lastContactAt = performance.now();
+      c.ackMs ??= Math.round(performance.now() - c.startedAt);
       c.acked = true;
+      if (m.type === "chat.status") {
+        if (m.n <= c.statusN) return; // late or duplicate
+        c.statusN = m.n;
+        // The worker has published deltas we haven't seen: recover the tail.
+        if (m.deltaCount > c.asm.seenUpTo) c.gapSince ??= performance.now();
+        c.callbacks.onStatus?.(m);
+        return;
+      }
       if (m.type === "chat.ack") {
         c.callbacks.onAck?.();
         return;
       }
       if (m.type === "chat.delta") {
         if (c.asm.add(m.seq, m.content, m.reasoning)) {
+          c.gapAttempts = 0; // recovery is making progress
           c.callbacks.onUpdate?.({ content: c.asm.content, reasoning: c.asm.reasoning });
         }
-        c.gapSince = c.asm.hasGap ? (c.gapSince ?? Date.now()) : null;
+        c.gapSince = c.asm.hasGap ? (c.gapSince ?? performance.now()) : null;
       } else {
         c.complete = m;
       }
       if (c.complete && !c.asm.hasGap && c.asm.nextSeq >= c.complete.deltaCount) this.#finalize(c);
       else if (c.complete && m.type === "chat.complete" && c.gapSince === null) {
-        c.gapSince = Date.now() - this.#o.resumeAfterMs - 1; // tail missing: recover on next tick
+        c.gapSince = performance.now() - this.#o.resumeAfterMs - 1; // tail missing: recover on next tick
       }
       return;
+    }
+    if (m.type === "server.error" && m.re && m.code === "not_found") {
+      // The worker no longer knows a chat we tried to resume (it restarted, or we were away too long).
+      for (const c of this.#chats.values()) {
+        if (!c.resumeIds.has(m.re)) continue;
+        if (c.complete) this.#finalize(c, true);
+        else this.#finishWithError(c.id, new RemoteError("not_found", "The worker no longer has this request. The text received so far was kept."));
+        return;
+      }
     }
     if (m.type === "server.error" && m.re && this.#chats.has(m.re)) {
       this.#finishWithError(m.re, new RemoteError(m.code, m.message || ERROR_TEXT[m.code], m.retryAfter));

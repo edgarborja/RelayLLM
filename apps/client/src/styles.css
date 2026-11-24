@@ -1281,3 +1281,30 @@ a {
 .auth-card .hint {
   margin: -8px 0 0;
 }
+
+/* ------------------------------------------------------------ generation status */
+.gen-status {
+  margin-top: 8px;
+  font-variant-numeric: tabular-nums;
+}
+.gen-status .dot {
+  display: inline-block;
+  margin-right: 4px;
+}
+.advanced .reasoning-select {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  background: var(--bg-elev);
+}
+.reasoning-select .row {
+  flex-wrap: wrap;
+  align-items: center;
+}
+.reasoning-select p {
+  margin: 4px 0 0;
+}
+.reasoning-select button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

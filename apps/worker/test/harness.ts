@@ -38,7 +38,7 @@ export async function makeHarness(
     name: "Test Worker",
     keyStorage: "file",
     provider: { kind: "lmstudio", baseUrl: provider.baseUrl, allowRemoteEndpoint: false, streaming: true, hasApiKey: false, systemPromptStyle: "system" },
-    models: { exposed: ["mock-llm-small", "mock-llm-large"], manual: [], systemPromptStyle: {} },
+    models: { exposed: ["mock-llm-small", "mock-llm-large"], manual: [], systemPromptStyle: {}, reasoning: {} },
     relays: [relay.url],
   });
   config.streaming.batchMs = 50;

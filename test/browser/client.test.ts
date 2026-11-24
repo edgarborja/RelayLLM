@@ -10,7 +10,7 @@ import { extname, join, normalize } from "node:path";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { chromium, type Browser, type Page } from "playwright";
-import { MockProvider, MockRelay } from "@relayllm/test-utils";
+import { MockProvider, MockRelay, type MockStep } from "@relayllm/test-utils";
 import { buildPairingUrl } from "@relayllm/nostr-transport";
 import { TEMPLATES } from "../../apps/client/src/lib/prompts.ts";
 import { createInvite } from "../../apps/worker/src/access.ts";
@@ -51,6 +51,7 @@ beforeAll(async () => {
   relay = await MockRelay.start();
   provider = await MockProvider.start({
     tokenDelayMs: 8,
+    reasoningOptions: ["off", "on"],
     reasoning: "considering the question",
     reply: (m) => {
       const last = m.filter((x) => x.role === "user").at(-1)?.content ?? "";
@@ -153,7 +154,7 @@ describe("static web client", () => {
     await page.locator(".msg.assistant .markdown").last().waitFor();
     await page.waitForFunction(() => (document.querySelector(".msg.assistant:last-child .markdown")?.textContent?.length ?? 0) > 50);
     await page.getByRole("button", { name: "Stop generating" }).click();
-    await page.getByText("Stopped.").waitFor({ timeout: 10_000 });
+    await page.getByText("Interrupted. The partial answer was kept.").waitFor({ timeout: 10_000 });
     const entry = provider.chats.at(-1)!;
     await expect.poll(() => entry.aborted, { timeout: 5000 }).toBe(true);
     expect(entry.tokensSent).toBeLessThan(600);
@@ -358,4 +359,105 @@ describe("static web client", () => {
     await expect(p5.getByText("to continue.").count()).resolves.toBe(0);
     await ctx.close();
   });
+
+  it("controls reasoning, shows live progress, and explains interrupted or cut-off replies", async () => {
+    const ctx = await browser.newContext();
+    const p = await ctx.newPage();
+    const errors: string[] = [];
+    p.on("pageerror", (e) => errors.push(e.message));
+    await p.goto(buildPairingUrl(baseUrl, { workerPubkey: worker.pubkey, relays: [relay.url], name: "Test Box", invite: createInvite(config, 600, "reasoning") }));
+    await createIdentity(p);
+    await p.getByRole("dialog").getByRole("button", { name: "Add worker" }).click();
+    await p.getByPlaceholder("Message…").waitFor({ timeout: 15_000 });
+    const script = (fn: () => Iterable<MockStep>) => (provider.opts.script = fn);
+    const state = p.locator(".gen-state");
+    const shot = (n: string) => (process.env.SHOTS ? p.screenshot({ path: `${process.env.SHOTS}/${n}.png` }) : undefined);
+    const lastMsg = p.locator(".msg.assistant").last();
+
+    // Reasoning off, chosen next to the system prompt in Advanced settings.
+    script(() => [{ answer: "quick" }, { finish: "stop" }]);
+    await p.getByText("Advanced settings").click();
+    await expect(p.getByRole("radio", { name: "Auto" }).getAttribute("aria-checked")).resolves.toBe("true");
+    await p.getByRole("radio", { name: "Off" }).click();
+    await shot("r1-selector");
+    await sendAndWait(p, "first");
+    expect(provider.chats.at(-1)!.body.reasoning_effort).toBe("none");
+
+    // Back to Auto mid-conversation, remembered with the conversation.
+    await p.getByRole("button", { name: "System prompt", exact: true }).click();
+    const dialog = p.getByRole("dialog");
+    await expect(dialog.getByRole("radio", { name: "Off" }).getAttribute("aria-checked")).resolves.toBe("true");
+    await dialog.getByRole("radio", { name: "Auto" }).click();
+    await dialog.getByRole("button", { name: "Save", exact: true }).click();
+
+    // Thinking is visible before any answer text; Stop keeps the partial answer.
+    let answer = false;
+    script(function* () {
+      yield { wait: 400 };
+      while (!answer) {
+        yield { reasoning: "considering this carefully. " };
+        yield { wait: 50 };
+      }
+      for (let i = 0; i < 3000; i++) {
+        yield { answer: `part${i} ` };
+        yield { wait: 50 };
+      }
+    });
+    await p.getByPlaceholder("Message…").fill("think");
+    await p.keyboard.press("Enter");
+    await expect.poll(() => state.textContent().catch(() => ""), { timeout: 8000 }).toBe("Thinking");
+    expect(provider.chats.at(-1)!.body).not.toHaveProperty("reasoning_effort");
+    await expect(lastMsg.locator(".markdown").count()).resolves.toBe(0);
+    await expect.poll(() => p.locator(".gen-status").textContent(), { timeout: 5000 }).toMatch(/Thinking · [\d.]+ s · ~\d+ reasoning tokens · ~[\d.]+ tok\/s/);
+    await shot("r2-thinking");
+    answer = true;
+    await expect.poll(() => state.textContent(), { timeout: 8000 }).toBe("Generating answer");
+    await expect.poll(() => lastMsg.locator(".markdown").textContent()).toContain("part3");
+    const chat = provider.chats.at(-1)!;
+    await p.getByRole("button", { name: "Stop generating" }).click();
+    await lastMsg.getByText("Interrupted. The partial answer was kept.").waitFor();
+    const kept = await lastMsg.locator(".markdown").textContent();
+    await expect.poll(() => chat.aborted).toBe(true);
+    await p.waitForTimeout(500);
+    expect(await lastMsg.locator(".markdown").textContent()).toBe(kept);
+    await expect(lastMsg.getByText("did not confirm").count()).resolves.toBe(0);
+
+    // Budget used up by reasoning: says exactly that, not "timeout".
+    script(() => [
+      { reasoning: "thinking and thinking" },
+      { finish: "length" },
+      { usage: { prompt_tokens: 20, completion_tokens: 3900, completion_tokens_details: { reasoning_tokens: 3900 } } },
+    ]);
+    config.limits.maxTokens = 3900;
+    await sendAndWait(p, "hard question");
+    const text = (await lastMsg.textContent()) ?? "";
+    expect(text).toContain("The generation budget (3,900 tokens) was used up by reasoning before an answer was produced.");
+    expect(text).not.toMatch(/time/i);
+    await shot("r3-budget");
+    config.limits.maxTokens = 16_384;
+
+    // A reload stops the orphaned request and keeps what was received.
+    script(function* () {
+      for (let i = 0; i < 3000; i++) {
+        yield { answer: `live${i} ` };
+        yield { wait: 50 };
+      }
+    });
+    await p.getByPlaceholder("Message…").fill("reload me");
+    await p.keyboard.press("Enter");
+    await expect.poll(() => lastMsg.locator(".markdown").textContent().catch(() => ""), { timeout: 8000 }).toContain("live3");
+    await p.waitForTimeout(1800); // text is saved periodically
+    const orphan = provider.chats.at(-1)!;
+    await p.reload();
+    await p.getByLabel("Password").fill(PASSWORD);
+    await p.getByRole("button", { name: "Unlock" }).click();
+    await expect.poll(() => orphan.aborted, { timeout: 10_000 }).toBe(true);
+    await p.locator(".conv-title").first().click();
+    await lastMsg.getByText("Interrupted. The partial answer was kept.").waitFor();
+    expect(await lastMsg.locator(".markdown").textContent()).toContain("live3");
+
+    provider.opts.script = undefined;
+    expect(errors).toEqual([]);
+    await ctx.close();
+  }, 90_000);
 });

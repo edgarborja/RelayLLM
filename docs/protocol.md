@@ -24,8 +24,8 @@ taken from a message field.
 |---|---|---|
 | `server.info` | – | `server.info.result` |
 | `models.list` | – | `models.list.result` |
-| `chat.start` | `model`, `messages[{role: system\|user\|assistant, content}]` (1–1000), `params?{temperature, top_p, max_tokens}` | `chat.ack`, `chat.delta`*, `chat.complete` |
-| `chat.cancel` | `target` (chat id) | (the stream ends with `finishReason: "cancelled"`) |
+| `chat.start` | `model`, `messages[{role: system\|user\|assistant, content}]` (1–1000), `params?{temperature, top_p, max_tokens, reasoning}` | `chat.ack`, `chat.status`*, `chat.delta`*, `chat.complete` |
+| `chat.cancel` | `target` (chat id) | `chat.cancel.result` (and the stream ends with `finishReason: "cancelled"`) |
 | `chat.resume` | `target`, `missing?[seq]` or `fromSeq?` | re-sent `chat.delta`s and `chat.complete` if finished |
 | `pair.request` | `token?` (invite), `label?` | `pair.result {status: approved\|pending\|denied}` |
 | `metrics.get` | `model?` (an exposed model), `host?` (bool) | `metrics.result` |
@@ -52,9 +52,11 @@ All carry `re`, the id of the request they answer.
 
 | type | fields |
 |---|---|
-| `server.info.result` | `name`, `software`, `versions`, `streaming{batchMs, resume}`, `limits{maxRequestBytes, maxResponseChars, maxMessages, requestTimeoutSec, maxSystemPromptChars?}` |
+| `server.info.result` | `name`, `software`, `versions`, `streaming{batchMs, resume}`, `limits{maxRequestBytes, maxResponseChars, maxMessages, requestTimeoutSec, maxSystemPromptChars?, heartbeatSec?, inactivityTimeoutSec?, maxTokens?}` |
 | `models.list.result` | `models[{id, contextLength?, streaming, cancel}]` (only models exposed to this user) |
 | `chat.ack` | `model` |
+| `chat.status` | `n` (increasing), `state` (loading\|prompt\|thinking\|answering\|finishing), `progress` (active\|quiet\|unknown), `elapsedMs`, `sinceProgressMs`, `deltaCount`, `reasoningTokens`, `answerTokens`, `tokensPerSecond` (nullable). On state changes (at most 1/s) and every `heartbeatSec`. |
+| `chat.cancel.result` | `target`, `status` (cancelled\|finished\|not_found\|unconfirmed) |
 | `chat.delta` | `seq` (0-based), `content?`, `reasoning?` |
 | `chat.complete` | `deltaCount`, `finishReason` (stop\|length\|cancelled\|error\|timeout), `errorCode?`, `contentLength`, `usage?{promptTokens, completionTokens, reasoningTokens?, source?, tokensPerSecond?, firstTokenMs?, generationMs?}` |
 | `metrics.result` | `at`, `provider`, `model` (ModelMetrics\|null), `engine` (EngineMetrics\|null), `host` (HostMetrics\|null), `monitoring{host, refreshSec}` |
@@ -66,6 +68,10 @@ Error codes: `unauthorized`, `pending_approval`, `rate_limited`, `busy`,
 `provider_unavailable`, `provider_error`, `timeout`, `too_large`, `not_found`,
 `expired`, `internal`. Messages are fixed strings. Provider bodies, file paths
 and stack traces are never forwarded.
+
+Newer `usage` fields (`answerTokens`, `sources`, `maxTokens`, `contextWindow`,
+`firstReasoningMs`, `firstAnswerMs`, `inferenceMs`, `detail`) sit inside `usage`
+because clients ignore unknown fields there. See [reasoning.md](reasoning.md).
 
 ## Metrics
 

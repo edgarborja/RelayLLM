@@ -50,6 +50,7 @@ See [docs/deploy-github-pages.md](docs/deploy-github-pages.md). In short: push t
 |---|---|
 | [docs/worker.md](docs/worker.md) | Worker installation, CLI, Bionic/Ollama notes, background service, limits |
 | [docs/deploy-github-pages.md](docs/deploy-github-pages.md) | Hosting the client |
+| [docs/reasoning.md](docs/reasoning.md) | Reasoning control, timeouts, cancellation, live statistics |
 | [docs/architecture.md](docs/architecture.md) | Design, transport choice (NIP-44, gift wrap, ContextVM, NIP-90), streaming |
 | [docs/protocol.md](docs/protocol.md) | Message schemas |
 | [docs/security.md](docs/security.md) | Threat model, metadata exposure, residual risks |

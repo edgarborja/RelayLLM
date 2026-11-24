@@ -8,5 +8,8 @@
   },
   "devDependencies": {
     "@relayllm/test-utils": "workspace:*"
+  },
+  "dependencies": {
+    "undici": "^7.30.2"
   }
 }

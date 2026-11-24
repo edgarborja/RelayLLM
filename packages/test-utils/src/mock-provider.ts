@@ -7,7 +7,26 @@ import type { AddressInfo } from "node:net";
  * tested without a GPU.
  */
 
+/** One step of a scripted engine stream. */
+export type MockStep =
+  | { reasoning: string }
+  | { answer: string }
+  | { wait: number }
+  /** SSE keep-alive comment: traffic without inference progress. */
+  | { keepAlive: true }
+  | { usage: Record<string, unknown> }
+  | { error: string }
+  | { finish: "stop" | "length" }
+  /** Drop the connection without finishing. */
+  | { drop: true }
+  /** Never send anything else. */
+  | { hang: true };
+
 export interface MockProviderOptions {
+  /** Full control over the stream, in place of `reply`. */
+  script?: (messages: { role: string; content: string }[]) => Iterable<MockStep>;
+  /** Reasoning settings advertised for every model (LM Studio native API). */
+  reasoningOptions?: string[];
   port?: number;
   models?: { id: string; type?: string }[];
   /** Reply text for a request; default echoes the last user message. */
@@ -95,6 +114,7 @@ export class MockProvider {
             size_bytes: 1_500_000_000,
             params_string: "1B",
             max_context_length: 32768,
+            ...(this.opts.reasoningOptions ? { capabilities: { reasoning: { allowed_options: this.opts.reasoningOptions, default: "on" } } } : {}),
             loaded_instances: i === 0 ? [{ id: m.id, config: { context_length: 4096 } }] : [],
           })),
         }),
@@ -120,6 +140,7 @@ export class MockProvider {
       const text = this.opts.reply
         ? this.opts.reply(messages)
         : `Echo: ${messages.filter((m) => m.role === "user").at(-1)?.content ?? ""}`;
+      if (this.opts.script) return this.#runScript(this.opts.script(messages), entry, res);
       const tokens = text.match(/\S+\s*|\s+/g) ?? [];
       if (!body.stream) {
         res.writeHead(200, { "content-type": "application/json" });
@@ -168,6 +189,34 @@ export class MockProvider {
       return;
     }
     res.writeHead(404).end();
+  }
+
+  async #runScript(steps: Iterable<MockStep>, entry: ChatLogEntry, res: ServerResponse): Promise<void> {
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+    res.flushHeaders();
+    res.on("close", () => {
+      if (!entry.finished) entry.aborted = true;
+    });
+    const send = (obj: unknown) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    for (const step of steps) {
+      if (entry.aborted || res.destroyed) return;
+      if ("wait" in step) await new Promise((r) => setTimeout(r, step.wait));
+      else if ("keepAlive" in step) res.write(": keep-alive\n\n");
+      else if ("usage" in step) send({ choices: [], usage: step.usage });
+      else if ("error" in step) send({ error: { message: step.error } });
+      else if ("finish" in step) send({ choices: [{ index: 0, delta: {}, finish_reason: step.finish }] });
+      else if ("hang" in step) return;
+      else if ("drop" in step) {
+        res.destroy();
+        return;
+      } else {
+        entry.tokensSent++;
+        send({ choices: [{ index: 0, delta: "reasoning" in step ? { reasoning_content: step.reasoning } : { content: step.answer }, finish_reason: null }] });
+      }
+    }
+    res.write("data: [DONE]\n\n");
+    entry.finished = true;
+    res.end();
   }
 
   async close(): Promise<void> {

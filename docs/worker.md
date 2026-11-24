@@ -40,7 +40,7 @@ No firewall rules, port forwarding or public IP are needed. The worker only make
 
 * Enable the local server in Bionic / LM Studio ("Developer → Start server"). Check the port it shows, since it's often 1234 or 1235.
 * Models that aren't loaded are loaded on first use (JIT), so the first reply can take longer.
-* Reasoning models (e.g. Qwen 3.x) stream their thinking separately; the client shows it in a collapsible "Reasoning" section. Thinking counts against `limits.maxTokens` (default 8192).
+* Reasoning models (e.g. Qwen 3.x) stream their thinking separately; the client shows it in a collapsible "Reasoning" section. Thinking counts against `limits.maxTokens` (default 16384). See [reasoning.md](reasoning.md) for reasoning control and timeouts.
 * RelayLLM never enables Bionic's tools, MCP or filesystem features. It only calls chat completions.
 
 ## Everyday commands
@@ -61,6 +61,8 @@ No firewall rules, port forwarding or public IP are needed. The worker only make
 | Engine API key | `relayllm provider set --api-key` (hidden prompt) |
 | How system prompts reach the engine | `relayllm provider set --system-style system\|developer\|user-prefix` |
 | …for one model only | `relayllm models system-style <id> user-prefix` (`default` to reset) |
+| Generation budget and timeouts | `relayllm limits --max-tokens 16384 --absolute 1800 --inactivity 120` |
+| Reasoning control (vLLM, generic) | `relayllm models reasoning <id> toggle` (or `effort`) |
 | Share machine memory stats with authorized users | `relayllm monitoring on` (`off` to stop; `--interval 10`) |
 | vLLM KV-cache / queue stats | `relayllm monitoring --engine-metrics on` (restart needed) |
 | Web client URL for links | `relayllm client-url https://you.github.io/relayllm/` |
@@ -83,11 +85,13 @@ User, model and access changes apply to a running worker within about 2 seconds.
   "requestsPerMinute": 20,       // per authorized user
   "publicRequestsPerMinute": 4,  // per public user
   "publicRequestsPerDay": 100,
-  "requestTimeoutSec": 300,
+  "requestTimeoutSec": 1800,     // absolute limit per request
+  "inactivityTimeoutSec": 120,   // no new text, once text has started
+  "heartbeatSec": 10,
   "maxRequestBytes": 400000,     // conversation context per request
   "maxMessages": 200,
   "maxResponseChars": 200000,
-  "maxTokens": 8192,             // cap (and default) for max_tokens
+  "maxTokens": 16384,            // generation budget: reasoning + answer
   "maxSystemPromptChars": 32000  // total length of a conversation's system prompt
 },
 "monitoring": { "host": false, "intervalSec": 10, "engineMetrics": false },

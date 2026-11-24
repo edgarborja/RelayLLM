@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { parsePairingUrl, type ChatHandle, type PairingInfo } from "@relayllm/nostr-transport";
-import { ERROR_TEXT, newId, type ErrorCode } from "@relayllm/protocol";
+import { newId } from "@relayllm/protocol";
 import { ChatView } from "./components/ChatView.tsx";
 import { ContextIndicator } from "./components/ContextIndicator.tsx";
 import { AddWorkerDialog, SettingsDialog, type ThemePref } from "./components/Dialogs.tsx";
 import { Onboarding } from "./components/Onboarding.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
+import { ReasoningSelector } from "./components/Reasoning.tsx";
 import { PromptLibraryDialog, SystemPromptDialog, SystemPromptEditor } from "./components/SystemPrompt.tsx";
 import { ConnectionManager, type ConnectionState } from "./lib/connection.ts";
 import { buildContext, titleFrom } from "./lib/context.ts";
 import { LocalDB, type ChatMessageRecord, type Conversation, type WorkerProfile } from "./lib/db.ts";
+import { describeFailure, effectiveReasoning, type LiveGeneration, type ReasoningPref } from "./lib/generation.ts";
 import { forgetIdentity, loadStoredIdentity, type UnlockedIdentity } from "./lib/identity.ts";
 import { autoName, DEFAULT_MAX_PROMPT_CHARS, describePrompt, MAX_LIBRARY, rememberPrompt, sortLibrary, type SavedPrompt } from "./lib/prompts.ts";
 
@@ -49,9 +51,7 @@ function takePairingFromUrl(): PairingInfo | null {
 }
 const initialPairing = takePairingFromUrl();
 
-function describeError(code?: ErrorCode): string {
-  return code ? ERROR_TEXT[code] : "The response failed.";
-}
+const chatLock = (requestId: string) => `relayllm-chat-${requestId}`;
 
 // ---------------------------------------------------------------- app
 
@@ -131,6 +131,10 @@ function Main({
   const [defaultPrompt, setDefaultPrompt] = useState("");
   /** System prompt for the next new conversation (advanced settings). */
   const [draftPrompt, setDraftPrompt] = useState("");
+  const [draftReasoning, setDraftReasoning] = useState<ReasoningPref>("auto");
+  const [live, setLive] = useState<Map<string, LiveGeneration>>(new Map());
+  /** Requests a previous page load left running. */
+  const orphans = useRef<{ workerId: string; requestId: string }[]>([]);
   const [editingPrompt, setEditingPrompt] = useState(false);
   const [showLibrary, setShowLibrary] = useState(false);
   const handles = useRef(new Map<string, ChatHandle>());
@@ -141,9 +145,23 @@ function Main({
   useEffect(() => {
     void (async () => {
       const [ws, cs] = await Promise.all([db.listWorkers(), db.listConversations()]);
+      // Replies still marked as streaming were cut off by a reload, unless another tab
+      // is running them (it holds a lock). Keep their text and stop them on the worker.
+      const held = new Set((await navigator.locks?.query())?.held?.map((l) => l.name) ?? []);
+      const restored = cs.map((c) => {
+        if (!c.messages.some((m) => m.status === "streaming" && !(m.requestId && held.has(chatLock(m.requestId))))) return c;
+        const messages = c.messages.map((m): ChatMessageRecord => {
+          if (m.status !== "streaming" || (m.requestId && held.has(chatLock(m.requestId)))) return m;
+          if (m.requestId && navigator.locks) orphans.current.push({ workerId: c.workerId, requestId: m.requestId });
+          return { ...m, status: "cancelled" };
+        });
+        const fixed = { ...c, messages };
+        void db.saveConversation(fixed);
+        return fixed;
+      });
       setWorkers(ws);
-      convsRef.current = cs;
-      setConversations(cs);
+      convsRef.current = restored;
+      setConversations(restored);
       setActiveWorkerId((cur) => (cur && ws.some((w) => w.id === cur) ? cur : (ws[0]?.id ?? null)));
 
       const [lib, settings] = await Promise.all([db.listPrompts(), db.getSettings()]);
@@ -172,7 +190,9 @@ function Main({
 
   // A new chat starts from the default prompt (before paint, so the previous draft never flashes).
   useLayoutEffect(() => {
-    if (!activeConvId) setDraftPrompt(defaultPrompt);
+    if (activeConvId) return;
+    setDraftPrompt(defaultPrompt);
+    setDraftReasoning("auto");
   }, [activeConvId, defaultPrompt]);
 
   const worker = workers.find((w) => w.id === activeWorkerId) ?? null;
@@ -189,6 +209,13 @@ function Main({
     if (conn.state.online && conn.state.access !== "approved") void conn.refresh();
     return unsub;
   }, [worker, conns]);
+
+  useEffect(() => {
+    if (!worker || connState?.access !== "approved") return;
+    const mine = orphans.current.filter((o) => o.workerId === worker.id);
+    orphans.current = orphans.current.filter((o) => o.workerId !== worker.id);
+    for (const o of mine) void conns.get(worker).cancelRequest(o.requestId);
+  }, [worker, connState?.access, conns]);
 
   // choose a valid model when the model list arrives
   useEffect(() => {
@@ -215,6 +242,8 @@ function Main({
   const persist = useCallback(
     (id: string, immediate = false) => {
       const t = saveTimers.current.get(id);
+      // A pending save is left alone, so a steady stream of updates can't postpone it forever.
+      if (t && !immediate) return;
       if (t) clearTimeout(t);
       const run = () => {
         saveTimers.current.delete(id);
@@ -283,13 +312,14 @@ function Main({
     if (entry) savePromptEntry({ ...entry, lastUsedAt: undefined });
   };
 
-  const setConversationPrompt = (convId: string, content: string) => {
+  const setConversationPrompt = (convId: string, content: string, reasoning: ReasoningPref) => {
     const systemPrompt = content.trim() ? content : undefined;
-    commit(convsRef.current.map((c) => (c.id === convId ? { ...c, systemPrompt } : c)));
+    commit(convsRef.current.map((c) => (c.id === convId ? { ...c, systemPrompt, reasoning: reasoning === "auto" ? undefined : reasoning } : c)));
     persist(convId, true);
     notePromptUsed(systemPrompt);
   };
 
+  const reasoningOptions = connState?.models.find((m) => m.id === model)?.reasoningOptions ?? [];
   const maxPromptChars = connState?.limits?.maxSystemPromptChars ?? DEFAULT_MAX_PROMPT_CHARS;
 
   // ---------------- chat
@@ -331,16 +361,33 @@ function Main({
         return;
       }
 
+      const reasoning = effectiveReasoning(base.reasoning, connState.models.find((m) => m.id === model)?.reasoningOptions);
+      const gen: LiveGeneration = {
+        startedAt: performance.now(),
+        lastContactAt: performance.now(),
+        acked: false,
+        heartbeatSec: connState.limits?.heartbeatSec ?? 10,
+      };
+      const contact = (patch: Partial<LiveGeneration> = {}) =>
+        setLive((l) => new Map(l).set(conv.id, Object.assign(gen, patch, { acked: true, lastContactAt: performance.now() })));
+      setLive((l) => new Map(l).set(conv.id, gen));
       const handle = conn.chat(
-        { model, messages: ctx.messages },
+        { model, messages: ctx.messages, params: reasoning ? { reasoning } : undefined },
         {
+          onAck: () => contact(),
+          onStatus: (status) => contact({ status }),
           onUpdate: (s) => {
+            contact({ firstTextAt: gen.firstTextAt ?? performance.now() });
             patchMessage(conv.id, asst.id, { content: s.content, reasoning: s.reasoning || undefined });
             persist(conv.id);
           },
         },
       );
       handles.current.set(conv.id, handle);
+      patchMessage(conv.id, asst.id, { requestId: handle.id });
+      persist(conv.id, true);
+      // Tells other tabs this request is alive; released when it ends or the tab closes.
+      void navigator.locks?.request(chatLock(handle.id), () => handle.result.catch(() => undefined));
       setStreamingIds(new Set(handles.current.keys()));
       try {
         const r = await handle.result;
@@ -349,10 +396,11 @@ function Main({
           content: r.content,
           reasoning: r.reasoning || undefined,
           status: r.finishReason === "cancelled" ? "cancelled" : failed ? "error" : "done",
-          error: failed ? describeError(r.errorCode) : undefined,
+          error: failed ? describeFailure(r.errorCode, r.usage) : undefined,
           truncated: r.finishReason === "length" || undefined,
           incomplete: r.incomplete || undefined,
           usage: r.usage,
+          timing: r.timing,
         });
       } catch (e) {
         const code = (e as { code?: string }).code;
@@ -360,6 +408,11 @@ function Main({
         if (code === "unauthorized" || code === "pending_approval" || code === "model_unavailable") void conn.refresh();
       } finally {
         handles.current.delete(conv.id);
+        setLive((l) => {
+          const next = new Map(l);
+          next.delete(conv.id);
+          return next;
+        });
         setStreamingIds(new Set(handles.current.keys()));
         persist(conv.id, true);
       }
@@ -383,6 +436,7 @@ function Main({
             updatedAt: now,
             messages: [user],
             systemPrompt: draftPrompt.trim() ? draftPrompt : undefined,
+            reasoning: draftReasoning === "auto" ? undefined : draftReasoning,
           };
     if (base.messages.length === 1) notePromptUsed(base.systemPrompt);
     if (worker.lastModel !== model) {
@@ -402,7 +456,15 @@ function Main({
   };
 
   const stop = () => {
-    if (activeConvId) void handles.current.get(activeConvId)?.cancel();
+    const convId = activeConvId;
+    const handle = convId ? handles.current.get(convId) : undefined;
+    if (!convId || !handle) return;
+    const msgId = convsRef.current.find((c) => c.id === convId)?.messages.at(-1)?.id;
+    void handle.cancel().then((outcome) => {
+      if (outcome !== "unconfirmed" || !msgId) return;
+      patchMessage(convId, msgId, { stopUnconfirmed: true });
+      persist(convId, true);
+    });
   };
 
   // ---------------- workers
@@ -506,7 +568,9 @@ function Main({
             limits={connState?.limits}
           />
         }
+        live={activeConvId ? live.get(activeConvId) : undefined}
         newChatAdvanced={
+          <div className="stack">
           <SystemPromptEditor
             value={draftPrompt}
             onChange={setDraftPrompt}
@@ -516,18 +580,22 @@ function Main({
             onSaveToLibrary={saveToLibrary}
             onManage={() => setShowLibrary(true)}
           />
+          <ReasoningSelector value={draftReasoning} options={reasoningOptions} onChange={setDraftReasoning} />
+          </div>
         }
       />
       {editingPrompt && conversation && (
         <SystemPromptDialog
           initial={conversation.systemPrompt ?? ""}
+          reasoning={conversation.reasoning ?? "auto"}
+          reasoningOptions={reasoningOptions}
           library={library}
           defaultPrompt={defaultPrompt}
           maxChars={maxPromptChars}
           onSaveToLibrary={saveToLibrary}
           onManage={() => setShowLibrary(true)}
-          onSave={(v) => {
-            setConversationPrompt(conversation.id, v);
+          onSave={(v, reasoning) => {
+            setConversationPrompt(conversation.id, v, reasoning);
             setEditingPrompt(false);
           }}
           onClose={() => setEditingPrompt(false)}

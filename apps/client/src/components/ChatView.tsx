@@ -3,8 +3,11 @@ import { hexToNpub } from "@relayllm/nostr-transport";
 import type { ModelInfo } from "@relayllm/protocol";
 import type { ChatMessageRecord, Conversation, WorkerProfile } from "../lib/db.ts";
 import type { ConnectionState } from "../lib/connection.ts";
+import { describeTruncation, fmtDuration, type LiveGeneration } from "../lib/generation.ts";
+import { fmtInt } from "../lib/metrics.ts";
 import { CopyButton, Markdown } from "./Markdown.tsx";
 import { IconChevron, IconMenu, IconPlus, IconRefresh, IconSend, IconServer, IconSliders, IconStop } from "./icons.tsx";
+import { GenerationStatus } from "./Reasoning.tsx";
 
 export interface ChatViewProps {
   conversation: Conversation | null;
@@ -32,6 +35,8 @@ export interface ChatViewProps {
   newChatAdvanced: ReactNode;
   /** Context usage indicator, shown next to the model selector. */
   contextIndicator?: ReactNode;
+  /** Live state of this conversation's running request. */
+  live?: LiveGeneration;
 }
 
 function StatusDot({ conn }: { conn: ConnectionState | null }) {
@@ -183,7 +188,7 @@ function AccessPanel({ conn, userPubkey, worker, onRequestAccess, onRefresh }: {
   );
 }
 
-function Message({ m, isLast, streaming, onRegenerate }: { m: ChatMessageRecord; isLast: boolean; streaming: boolean; onRegenerate: () => void }) {
+function Message({ m, isLast, streaming, live: gen, online, onRegenerate }: { m: ChatMessageRecord; isLast: boolean; streaming: boolean; live?: LiveGeneration; online: boolean; onRegenerate: () => void }) {
   if (m.role === "user") {
     return (
       <div className="msg user">
@@ -208,11 +213,17 @@ function Message({ m, isLast, streaming, onRegenerate }: { m: ChatMessageRecord;
           <div className="reasoning-body">{m.reasoning}</div>
         </details>
       )}
-      {m.content ? <Markdown text={m.content} /> : live && !m.reasoning ? <div className="typing"><span /><span /><span /></div> : null}
+      {m.content ? <Markdown text={m.content} /> : live && !m.reasoning && !gen ? <div className="typing"><span /><span /><span /></div> : null}
+      {live && gen && <GenerationStatus live={gen} message={m} online={online} />}
       {m.status === "error" && <div className="error-banner">{m.error ?? "Something went wrong."}</div>}
-      {m.status === "cancelled" && <div className="meta-note">Stopped.</div>}
+      {m.status === "cancelled" && (
+        <div className="meta-note">
+          Interrupted.{m.content ? " The partial answer was kept." : ""}
+          {m.stopUnconfirmed ? " The worker did not confirm that it stopped, so it may still be generating." : ""}
+        </div>
+      )}
       {m.incomplete && <div className="meta-note">Parts of this response were lost in transit.</div>}
-      {m.truncated && <div className="meta-note">The response reached the maximum length.</div>}
+      {m.truncated && (m.content ? <div className="meta-note">{describeTruncation(m)}</div> : <div className="error-banner">{describeTruncation(m)}</div>)}
       {!live && (
         <div className="msg-actions">
           {m.content && <CopyButton text={m.content} />}
@@ -221,7 +232,18 @@ function Message({ m, isLast, streaming, onRegenerate }: { m: ChatMessageRecord;
               <IconRefresh />
             </button>
           )}
-          {m.model && <span className="small muted">{m.model}</span>}
+          {m.model && (
+            <span className="small muted">
+              {m.model}
+              {m.status === "done" && m.usage?.inferenceMs !== undefined && (
+                <>
+                  {" "}
+                  · {fmtDuration(m.usage.inferenceMs)} · {m.usage.source === "estimated" ? "~" : ""}
+                  {fmtInt(m.usage.completionTokens ?? 0)} tokens
+                </>
+              )}
+            </span>
+          )}
         </div>
       )}
     </div>
@@ -293,7 +315,7 @@ export function ChatView(p: ChatViewProps) {
           <button
             className={`icon-btn ${p.systemPromptName ? "accent" : ""}`}
             onClick={p.onEditPrompt}
-            title={p.systemPromptName ? `System prompt: ${p.systemPromptName}` : "Add a system prompt"}
+            title={p.systemPromptName ? `System prompt: ${p.systemPromptName}. Reasoning and prompt settings` : "System prompt and reasoning"}
             aria-label="System prompt"
           >
             <IconSliders />
@@ -347,7 +369,7 @@ export function ChatView(p: ChatViewProps) {
             </button>
           )}
           {messages.map((m, i) => (
-            <Message key={m.id} m={m} isLast={i === messages.length - 1} streaming={p.streaming} onRegenerate={p.onRegenerate} />
+            <Message key={m.id} m={m} isLast={i === messages.length - 1} streaming={p.streaming} live={i === messages.length - 1 ? p.live : undefined} online={!!p.conn?.online} onRegenerate={p.onRegenerate} />
           ))}
           {p.conversation && p.conversation.workerId !== p.worker?.id && (
             <p className="small muted center">This conversation belongs to a worker that is no longer configured.</p>

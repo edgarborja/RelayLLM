@@ -58,7 +58,8 @@ describe("authorized access", () => {
     // Only allowlisted params reached the provider, max_tokens clamped.
     const body = h.provider.chats[0]!.body;
     expect(Object.keys(body).sort()).toEqual(["max_tokens", "messages", "model", "stream", "stream_options", "temperature"]);
-    expect(body.max_tokens).toBe(h.config.limits.maxTokens);
+    // The budget is cut to what fits beside the prompt in the mock's 4,096-token window.
+    expect(body.max_tokens).toBe(4096 - (8 + 1) - 64);
   });
 
   it("streams reasoning separately from content", async () => {
