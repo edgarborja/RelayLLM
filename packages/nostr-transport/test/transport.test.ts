@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import * as nip44 from "nostr-tools/nip44";
 import {
+  DEFAULT_RELAYS,
   fragmentText,
   INNER_KIND,
   isFragment,
@@ -225,5 +226,13 @@ describe("pairing URLs", () => {
     expect(p.relays).toEqual(["wss://ok.example"]);
     expect(p.invite).toBeUndefined();
     expect(normalizeRelayUrl("relay.example")).toBe("wss://relay.example");
+  });
+
+  it("leaves out the default relays, which readers then assume", () => {
+    const url = buildPairingUrl("https://x/", { workerPubkey: worker.pubkey, relays: [...DEFAULT_RELAYS].reverse(), invite: "abcdefghijklmnop1234" });
+    expect(url).not.toContain("relay=");
+    expect(parsePairingUrl(url)!.relays).toEqual(DEFAULT_RELAYS);
+    // A subset is not the default set: it is spelled out.
+    expect(buildPairingUrl("https://x/", { workerPubkey: worker.pubkey, relays: [DEFAULT_RELAYS[0]!] })).toContain("relay=");
   });
 });

@@ -1,11 +1,11 @@
 import { useState, type FormEvent, type ReactNode } from "react";
-import { hexToNpub, normalizeRelayUrl, npubToHex, parsePairingUrl, type PairingInfo } from "@relayllm/nostr-transport";
+import { DEFAULT_RELAYS as SHARED_RELAYS, hexToNpub, normalizeRelayUrl, npubToHex, parsePairingUrl, type PairingInfo } from "@relayllm/nostr-transport";
 import type { WorkerProfile } from "../lib/db.ts";
 import { revealDeviceNsec, revealNsec, type StoredIdentity } from "../lib/identity.ts";
 import { CopyButton } from "./Markdown.tsx";
 import { IconTrash, IconX } from "./icons.tsx";
 
-export const DEFAULT_RELAYS = ["wss://relay.k1.sv", "wss://nos.lol"];
+export const DEFAULT_RELAYS = [...SHARED_RELAYS];
 
 export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
   return (

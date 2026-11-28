@@ -1,7 +1,10 @@
 import * as nip19 from "nostr-tools/nip19";
 
 /**
- * Pairing links: `<clientUrl>?worker=npub1...&relay=wss://a&relay=wss://b[&name=Home]#invite=<token>`
+ * Pairing links: `<clientUrl>?worker=npub1...[&relay=wss://a&relay=wss://b][&name=Home]#invite=<token>`
+ *
+ * Relays are left out when they are exactly DEFAULT_RELAYS, which readers
+ * then assume.
  *
  * Worker identity and relays go in the query string (not secret). The
  * optional single-use invite token goes in the URL fragment so it is never
@@ -16,6 +19,11 @@ export interface PairingInfo {
 }
 
 export const MAX_RELAYS = 8;
+
+/** Relays both sides assume when a pairing link names none. Changing this breaks such links. */
+export const DEFAULT_RELAYS: readonly string[] = ["wss://relay.k1.sv", "wss://nos.lol", "wss://relay.damus.io"];
+
+const sameSet = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x) => b.includes(x));
 
 export function npubToHex(npub: string): string | null {
   const s = npub.trim();
@@ -54,7 +62,8 @@ export function normalizeRelayUrl(input: string): string | null {
 export function buildPairingUrl(clientUrl: string, info: PairingInfo): string {
   const u = new URL(clientUrl);
   u.searchParams.set("worker", hexToNpub(info.workerPubkey));
-  for (const r of info.relays.slice(0, MAX_RELAYS)) u.searchParams.append("relay", r);
+  const relays = info.relays.slice(0, MAX_RELAYS);
+  if (!sameSet(relays, DEFAULT_RELAYS)) for (const r of relays) u.searchParams.append("relay", r);
   if (info.name) u.searchParams.set("name", info.name.slice(0, 64));
   if (info.invite) u.hash = `invite=${encodeURIComponent(info.invite)}`;
   return u.toString();
@@ -80,5 +89,6 @@ export function parsePairingUrl(url: string | URL): PairingInfo | null {
   const name = get("name")?.replace(/[\u0000-\u001f]/g, "").slice(0, 64) || undefined;
   const inviteRaw = hashParams.get("invite") ?? u.searchParams.get("invite");
   const invite = inviteRaw && /^[A-Za-z0-9_-]{16,128}$/.test(inviteRaw) ? inviteRaw : undefined;
-  return { workerPubkey, relays: [...new Set(relays)].slice(0, MAX_RELAYS), name, invite };
+  const unique = [...new Set(relays)].slice(0, MAX_RELAYS);
+  return { workerPubkey, relays: unique.length ? unique : [...DEFAULT_RELAYS], name, invite };
 }

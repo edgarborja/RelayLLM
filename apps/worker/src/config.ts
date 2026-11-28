@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { z } from "zod";
 import { REASONING_MODES, SYSTEM_PROMPT_STYLES } from "@relayllm/provider-adapters";
 
-export const DEFAULT_RELAYS = ["wss://relay.k1.sv", "wss://nos.lol", "wss://relay.damus.io"];
+import { DEFAULT_RELAYS as SHARED_RELAYS } from "@relayllm/nostr-transport";
+
+export const DEFAULT_RELAYS = [...SHARED_RELAYS];
 /** No default: pairing links must point at a client deployment you control. */
 export const DEFAULT_CLIENT_URL = "";
 
