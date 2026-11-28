@@ -1,7 +1,7 @@
 import { useState, type FormEvent, type ReactNode } from "react";
 import { hexToNpub, normalizeRelayUrl, npubToHex, parsePairingUrl, type PairingInfo } from "@relayllm/nostr-transport";
 import type { WorkerProfile } from "../lib/db.ts";
-import { revealNsec, type StoredIdentity } from "../lib/identity.ts";
+import { revealDeviceNsec, revealNsec, type StoredIdentity } from "../lib/identity.ts";
 import { CopyButton } from "./Markdown.tsx";
 import { IconTrash, IconX } from "./icons.tsx";
 
@@ -132,9 +132,33 @@ export function SettingsDialog(props: {
             <CopyButton text={npub} label="Copy npub" />
           </div>
           <p className="small muted">
-            {props.identity.type === "local" ? "Local key, encrypted with your password." : "Managed by your Nostr browser extension."} Give this npub to a worker owner
-            to get access.
+            {props.identity.type === "device"
+              ? "Kept by this browser, without a password. Anyone using this browser profile can use it; clearing the site's data removes it."
+              : props.identity.type === "local"
+                ? "Local key, encrypted with your password."
+                : "Managed by your Nostr browser extension."}{" "}
+            Give this npub to a worker owner to get access.
           </p>
+          {props.identity.type === "device" && !nsec && (
+            <button
+              className="btn small"
+              onClick={() => {
+                const stored = props.identity;
+                if (stored.type === "device") revealDeviceNsec(stored).then(setNsec, (e: Error) => setRevealErr(e.message));
+              }}
+            >
+              Show nsec (backup)
+            </button>
+          )}
+          {props.identity.type === "device" && nsec && (
+            <div className="secret-box">
+              <span className="mono ellipsis">{nsec}</span>
+              <CopyButton text={nsec} label="Copy nsec" />
+              <button className="btn small ghost" onClick={() => setNsec(null)}>
+                Hide
+              </button>
+            </div>
+          )}
           {props.identity.type === "local" &&
             (nsec ? (
               <div className="secret-box">
@@ -166,9 +190,11 @@ export function SettingsDialog(props: {
             ))}
           {revealErr && <p className="error-text">{revealErr}</p>}
           <div className="row">
-            <button className="btn small" onClick={props.onLock}>
-              Lock
-            </button>
+            {props.identity.type !== "device" && (
+              <button className="btn small" onClick={props.onLock}>
+                Lock
+              </button>
+            )}
             <button className="btn small ghost danger-text" onClick={props.onForget}>
               Sign out &amp; remove identity
             </button>

@@ -1,10 +1,11 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import {
   connectNip07,
-  createLocalIdentity,
+  createDeviceIdentity,
   forgetIdentity,
   hasNip07,
   parseSecretKey,
+  unlockDevice,
   unlockLocal,
   WrongPasswordError,
   type StoredIdentity,
@@ -13,20 +14,28 @@ import {
 import { hexToNpub } from "@relayllm/nostr-transport";
 import { IconLock } from "./icons.tsx";
 
-type Mode = "choose" | "create" | "import";
+type Mode = "choose" | "import";
+
+/**
+ * Opening or creating an identity without user input happens once per page
+ * load, even if React mounts this twice.
+ */
+let automatic: Promise<UnlockedIdentity> | null = null;
+let started = false;
 
 export function Onboarding({
   stored,
   onUnlocked,
-  pairingName,
+  fromInvite,
 }: {
   stored: StoredIdentity | null;
   onUnlocked: (u: UnlockedIdentity) => void;
-  pairingName?: string;
+  /** Opened from a pairing link: set up without asking anything. */
+  fromInvite: boolean;
 }) {
+  const auto = stored?.type === "device" || (!stored && fromInvite);
   const [mode, setMode] = useState<Mode>("choose");
   const [password, setPassword] = useState("");
-  const [password2, setPassword2] = useState("");
   const [nsec, setNsec] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -43,6 +52,29 @@ export function Onboarding({
     }
   };
 
+  useEffect(() => {
+    if (!auto || started) return;
+    started = true;
+    automatic ??= stored?.type === "device" ? unlockDevice(stored) : createDeviceIdentity();
+    void run(() => automatic!);
+    // Once, on mount.
+  }, []);
+
+  const startOver = (
+    <button
+      type="button"
+      className="btn ghost wide danger-text"
+      onClick={() => {
+        if (confirm("Remove this identity from this browser? Local chats encrypted with it become unreadable unless you sign in with the same key again.")) {
+          forgetIdentity();
+          location.reload();
+        }
+      }}
+    >
+      Use a different identity
+    </button>
+  );
+
   const brand = (
     <div className="brand-hero">
       <div className="logo-mark" aria-hidden>
@@ -50,21 +82,42 @@ export function Onboarding({
       </div>
       <h1>RelayLLM</h1>
       <p className="muted">Private AI on your own hardware, reachable from anywhere through encrypted Nostr messages.</p>
-      {pairingName && <p className="pill">Pairing with “{pairingName}” after you sign in</p>}
     </div>
   );
 
-  // ---------------- unlock an existing identity
+  // ---------------- opened or created without asking
+  if (auto) {
+    return (
+      <div className="center-screen">
+        <div className="card auth-card">
+          {brand}
+          {error ? (
+            <>
+              <p className="error-text">{error}</p>
+              {stored ? startOver : <button className="btn primary wide" onClick={() => location.reload()}>Try again</button>}
+            </>
+          ) : (
+            <p className="muted center" aria-live="polite">
+              {stored ? "Opening…" : "Setting up…"}
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ---------------- unlock an older password-protected identity, or an extension
   if (stored) {
     const submit = (e: FormEvent) => {
       e.preventDefault();
       if (stored.type === "local") void run(() => unlockLocal(stored, password));
-      else void run(() => connectNip07(stored));
+      else if (stored.type === "nip07") void run(() => connectNip07(stored));
     };
     return (
       <div className="center-screen">
         <form className="card auth-card" onSubmit={submit}>
           {brand}
+          {fromInvite && <p className="pill">The invitation is applied once you unlock.</p>}
           <div className="identity-line">
             <IconLock />
             <span className="mono ellipsis">{hexToNpub(stored.pubkey)}</span>
@@ -81,31 +134,20 @@ export function Onboarding({
           <button className="btn primary wide" disabled={busy || (stored.type === "local" && !password)}>
             {busy ? "Unlocking…" : stored.type === "local" ? "Unlock" : "Connect extension"}
           </button>
-          <button
-            type="button"
-            className="btn ghost wide danger-text"
-            onClick={() => {
-              if (confirm("Remove this identity from this browser? Local chats encrypted with it become unreadable unless you sign in with the same key again.")) {
-                forgetIdentity();
-                location.reload();
-              }
-            }}
-          >
-            Use a different identity
-          </button>
+          {startOver}
         </form>
       </div>
     );
   }
 
-  // ---------------- first run
+  // ---------------- first run without an invitation
   if (mode === "choose") {
     return (
       <div className="center-screen">
         <div className="card auth-card">
           {brand}
           <p className="small muted">You need a Nostr identity. Workers authorize you by its public key (npub).</p>
-          <button className="btn primary wide" onClick={() => setMode("create")}>
+          <button className="btn primary wide" disabled={busy} onClick={() => void run(() => createDeviceIdentity())}>
             Create a new identity
           </button>
           <button className="btn wide" onClick={() => setMode("import")}>
@@ -114,87 +156,39 @@ export function Onboarding({
           <button className="btn wide" disabled={!hasNip07() || busy} onClick={() => void run(() => connectNip07())} title={hasNip07() ? "" : "No NIP-07 extension detected"}>
             Use Nostr browser extension{hasNip07() ? "" : " (not detected)"}
           </button>
+          <p className="small muted">The key is kept by this browser; there is no password. Back it up from Settings if you want to use it elsewhere.</p>
           {error && <p className="error-text">{error}</p>}
         </div>
       </div>
     );
   }
 
-  const MIN = 8;
-  const short = password.length < MIN;
-  const mismatch = password2.length > 0 && password !== password2;
-  const missing = mode === "import" && !nsec.trim() ? "Paste your nsec" : short ? `Password needs at least ${MIN} characters` : !password2 ? "Repeat the password" : password2 !== password ? "Make both passwords match" : null;
-
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    if (missing) return;
-    if (password !== password2) {
-      setError("Passwords do not match.");
+    let key: Uint8Array;
+    try {
+      key = parseSecretKey(nsec);
+    } catch {
+      setError("That does not look like a valid nsec.");
       return;
     }
-    if (mode === "import") {
-      let key: Uint8Array;
-      try {
-        key = parseSecretKey(nsec);
-      } catch {
-        setError("That does not look like a valid nsec.");
-        return;
-      }
-      setNsec("");
-      void run(() => createLocalIdentity(password, key));
-    } else {
-      void run(() => createLocalIdentity(password));
-    }
+    setNsec("");
+    void run(() => createDeviceIdentity(key));
   };
 
   return (
     <div className="center-screen">
       <form className="card auth-card" onSubmit={submit}>
         {brand}
-        <h2>{mode === "create" ? "Create identity" : "Import identity"}</h2>
-        {mode === "import" && (
-          <label className="field">
-            <span>nsec</span>
-            <input type="password" autoComplete="off" spellCheck={false} value={nsec} onChange={(e) => setNsec(e.target.value)} placeholder="nsec1…" />
-          </label>
-        )}
+        <h2>Import identity</h2>
         <label className="field">
-          <span>Password (protects your key in this browser)</span>
-          <input
-            type="password"
-            autoFocus
-            autoComplete="new-password"
-            minLength={MIN}
-            aria-describedby="pw-hint"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
+          <span>nsec</span>
+          <input type="password" autoFocus autoComplete="off" spellCheck={false} value={nsec} onChange={(e) => setNsec(e.target.value)} placeholder="nsec1…" />
         </label>
-        <p id="pw-hint" className={`small hint ${password && !short ? "ok-text" : "muted"}`}>
-          {password && !short ? "✓ " : ""}At least {MIN} characters{short && password ? ` (${MIN - password.length} more)` : ""}
-        </p>
-        <label className="field">
-          <span>Repeat password</span>
-          <input type="password" autoComplete="new-password" aria-describedby="pw2-hint" aria-invalid={mismatch} value={password2} onChange={(e) => setPassword2(e.target.value)} />
-        </label>
-        {mismatch && (
-          <p id="pw2-hint" className="small hint error-text">
-            Passwords don’t match yet
-          </p>
-        )}
-        <p className="small muted">
-          The key is encrypted with your password (NIP-49) and stored only in this browser. There is no account recovery — if you forget the password,
-          create a new identity and ask the worker owner to authorize it.
-        </p>
         {error && <p className="error-text">{error}</p>}
-        <button className="btn primary wide" disabled={busy || !!missing}>
-          {busy ? "Encrypting…" : mode === "create" ? "Create identity" : "Import"}
+        <button className="btn primary wide" disabled={busy || !nsec.trim()}>
+          Import
         </button>
-        {missing && !busy && (
-          <p className="small muted center" aria-live="polite">
-            {missing} to continue.
-          </p>
-        )}
         <button type="button" className="btn ghost wide" onClick={() => setMode("choose")}>
           Back
         </button>

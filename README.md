@@ -25,9 +25,9 @@ relayllm start
 
 ### 2. Client
 
-Open the pairing link on any device, create an identity (just a password), confirm the worker, and start chatting. The link contains a single-use invite, so access is granted automatically.
+Open the pairing link on any device and start chatting. The client creates an identity for that browser, adds the worker from the link, and redeems the link's single-use invite, all without questions or a password.
 
-Without a link: open your client URL, choose **Add worker**, and paste the worker's npub and relays (shown by `relayllm pair`). Then press **Request access** and approve yourself on the worker with `relayllm users approve <npub>`.
+Without a link: open your client URL, choose **Create a new identity** and then **Add worker**, and paste the worker's npub and relays (shown by `relayllm pair`). Then press **Request access** and approve yourself on the worker with `relayllm users approve <npub>`.
 
 ### 3. Host the client
 
@@ -41,7 +41,7 @@ See [docs/deploy-github-pages.md](docs/deploy-github-pages.md). In short: push t
 * A chat UI comparable to modern assistants: conversation history, rename/delete, markdown with highlighted code, copy, regenerate, multiple workers and models, dark/light themes, mobile layout.
 * Per-conversation system prompts. Set one under **Advanced settings** in a new chat, or start from a template (Spanish ⇄ English translator, American War of Independence fiction writer, sponsor–child correspondence reviewer). Edit it mid-conversation with the sliders button; used prompts are kept in an encrypted library, and a default can be set for new chats.
 * A context indicator next to the model selector shows how much of the model's loaded context window the conversation uses. Click it for model details (maximum vs. loaded context, load state, memory), the latest generation speed, and, if the worker owner enables `relayllm monitoring on`, the machine's RAM, swap and memory pressure.
-* Local-only history in IndexedDB, encrypted at rest. Identities are protected with NIP-49 or kept in a NIP-07 extension.
+* Local-only history in IndexedDB, encrypted at rest. Identities are kept by the browser without a password (older password-protected NIP-49 identities still work) or in a NIP-07 extension.
 * A command and Node library, `relayllm-api`, for calling the worker from scripts, with JSON output that follows a schema and resumable batches.
 * No telemetry and no RelayLLM account or server.
 

@@ -3,7 +3,7 @@ import { parsePairingUrl, type ChatHandle, type PairingInfo } from "@relayllm/no
 import { newId } from "@relayllm/protocol";
 import { ChatView } from "./components/ChatView.tsx";
 import { ContextIndicator } from "./components/ContextIndicator.tsx";
-import { AddWorkerDialog, SettingsDialog, type ThemePref } from "./components/Dialogs.tsx";
+import { AddWorkerDialog, DEFAULT_RELAYS, SettingsDialog, type ThemePref } from "./components/Dialogs.tsx";
 import { Onboarding } from "./components/Onboarding.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
 import { ReasoningSelector } from "./components/Reasoning.tsx";
@@ -79,7 +79,7 @@ export function App() {
   }, []);
 
   if (!session) {
-    return <Onboarding stored={stored} onUnlocked={(u) => void onUnlocked(u)} pairingName={initialPairing?.name} />;
+    return <Onboarding stored={stored} onUnlocked={(u) => void onUnlocked(u)} fromInvite={!!initialPairing} />;
   }
   return (
     <Main
@@ -124,6 +124,7 @@ function Main({
   const [model, setModel] = useState("");
   const [connState, setConnState] = useState<ConnectionState | null>(null);
   const [pairing, setPairing] = useState<PairingInfo | null>(initialPairing);
+  const [loaded, setLoaded] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -160,6 +161,7 @@ function Main({
         return fixed;
       });
       setWorkers(ws);
+      setLoaded(true);
       convsRef.current = restored;
       setConversations(restored);
       setActiveWorkerId((cur) => (cur && ws.some((w) => w.id === cur) ? cur : (ws[0]?.id ?? null)));
@@ -492,6 +494,15 @@ function Main({
     }
   };
 
+  // A pairing link is applied as it is, without questions, and opens a new chat.
+  const applied = useRef(false);
+  useEffect(() => {
+    if (!loaded || !pairing || applied.current) return;
+    applied.current = true;
+    const p = pairing;
+    void addWorker({ id: p.workerPubkey, name: p.name || "My worker", relays: p.relays.length ? p.relays : DEFAULT_RELAYS, addedAt: Date.now() }, p.invite);
+  }, [loaded, pairing]);
+
   const selectConversation = (id: string) => {
     const c = conversations.find((x) => x.id === id);
     setActiveConvId(id);
@@ -601,14 +612,10 @@ function Main({
           onClose={() => setEditingPrompt(false)}
         />
       )}
-      {(showAdd || pairing) && (
+      {showAdd && (
         <AddWorkerDialog
-          initial={pairing ?? undefined}
           onAdd={(p, invite) => void addWorker(p, invite)}
-          onClose={() => {
-            setShowAdd(false);
-            setPairing(null);
-          }}
+          onClose={() => setShowAdd(false)}
         />
       )}
       {showSettings && (

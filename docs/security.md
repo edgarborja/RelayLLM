@@ -58,16 +58,17 @@ Relays cannot see prompts, responses, model names, your identity, or the worker'
 
 * **Worker key:** stored in the macOS Keychain, or in an owner-only `0600` file under `~/.relayllm/secrets` (Linux, or by choice). It is never logged or published. Rotating it (`relayllm identity rotate`) changes the npub, so every device must be paired again; the old key is deleted.
 * **Provider API key:** stored in the same secret store and sent only to the configured loopback endpoint.
-* **Browser identity:** stored as a NIP-49 `ncryptsec` (scrypt with N=2^16, then XChaCha20-Poly1305) under your password. NIP-07 users keep the key in their extension. Private keys never appear in URLs.
+* **Browser identity:** new identities are created without a password. The key is encrypted with a non-extractable AES-256-GCM key that the browser generates and keeps in IndexedDB, and it unlocks automatically. Identities created before this keep their NIP-49 `ncryptsec` (scrypt with N=2^16, then XChaCha20-Poly1305) under a password. NIP-07 users keep the key in their extension. Private keys never appear in URLs.
+* **Opening a pairing link** adds that worker and redeems its invite without asking, and its details can't be edited on the way. A link from someone else can therefore add a worker you don't control; only open links from the worker's owner.
 * **Pairing links** contain only the worker npub, relays, display name, and an optional single-use invite. The invite is in the URL fragment, so it isn't sent to the static host. It expires (7 days by default) and only a SHA-256 hash is stored on the worker.
 
 ## Browser storage threat model
 
 Conversations (including each one's system prompt), saved system prompts, the default prompt, and the worker list are encrypted in IndexedDB with AES-256-GCM, bound to their record id. Older versions kept one global system prompt in plaintext `localStorage`. It is moved into the encrypted store, and removed from `localStorage`, the first time the identity is unlocked. The key is a random data key, stored NIP-44-encrypted to your own pubkey, and only an unlocked identity can recover it.
 
-Protected against: someone copying the browser profile while the app is locked; other identities using the same browser.
+Protected against: copies of the stored records alone; other identities using the same browser. A password identity is also protected against someone copying the whole browser profile while the app is locked; a device identity is not, because the browser can always open it.
 
-Not protected against: malware or a malicious extension running while the app is unlocked; a compromised static host serving modified JavaScript (pin your own deployment); someone who knows your vault password and has the profile. Timestamps and record counts are not encrypted. Clearing site data deletes everything, and nothing is backed up anywhere.
+Not protected against: malware or a malicious extension running while the app is unlocked; a compromised static host serving modified JavaScript (pin your own deployment); anyone who can use your browser profile (device identity) or knows your password and has the profile (password identity). Timestamps and record counts are not encrypted. Clearing site data deletes everything, and nothing is backed up anywhere.
 
 ## Rendering untrusted model output
 

@@ -11,6 +11,9 @@ import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { chromium, type Browser, type Page } from "playwright";
 import { MockProvider, MockRelay, type MockStep } from "@relayllm/test-utils";
+import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
+import * as nip44 from "nostr-tools/nip44";
+import * as nip49 from "nostr-tools/nip49";
 import { buildPairingUrl } from "@relayllm/nostr-transport";
 import { TEMPLATES } from "../../apps/client/src/lib/prompts.ts";
 import { createInvite } from "../../apps/worker/src/access.ts";
@@ -99,11 +102,13 @@ afterAll(async () => {
   await relay?.close();
 });
 
-async function createIdentity(page: Page) {
-  await page.getByRole("button", { name: "Create a new identity" }).click();
-  await page.getByLabel("Password (protects your key in this browser)").fill(PASSWORD);
-  await page.getByLabel("Repeat password").fill(PASSWORD);
-  await page.getByRole("button", { name: "Create identity" }).click();
+/** An identity from before device keys: password-protected (NIP-49). */
+function legacyIdentity() {
+  const sk = generateSecretKey();
+  const pubkey = getPublicKey(sk);
+  const dataKey = Buffer.from(generateSecretKey()).toString("hex");
+  const wrappedDataKey = nip44.encrypt(dataKey, nip44.getConversationKey(sk, pubkey));
+  return { pubkey, stored: JSON.stringify({ type: "local", pubkey, ncryptsec: nip49.encrypt(sk, PASSWORD, 16, 0x02), wrappedDataKey }) };
 }
 
 async function sendAndWait(page: Page, text: string) {
@@ -126,10 +131,14 @@ describe("static web client", () => {
     // Pairing parameters are removed from the address bar immediately.
     expect(page.url()).toBe(baseUrl);
 
-    await createIdentity(page);
-    await page.getByRole("dialog").getByRole("button", { name: "Add worker" }).click();
+    // No identity screen, no passphrase and no worker dialog: straight to a new chat.
     await page.getByPlaceholder("Message…").waitFor({ timeout: 15_000 });
+    expect(await page.getByRole("dialog").count()).toBe(0);
+    expect(await page.locator("input[type=password]").count()).toBe(0);
     expect(config.access.users).toHaveLength(1);
+    const stored = JSON.parse((await page.evaluate(() => localStorage.getItem("relayllm.identity.v1")))!);
+    expect(stored).toMatchObject({ type: "device", pubkey: config.access.users[0]!.pubkey });
+    expect(JSON.stringify(stored)).not.toMatch(/nsec1|[0-9a-f]{64}"?$/);
 
     await sendAndWait(page, "hello there");
     await expect(page.locator(".msg.assistant .markdown").last().textContent()).resolves.toContain("You said: hello there");
@@ -160,13 +169,8 @@ describe("static web client", () => {
     expect(entry.tokensSent).toBeLessThan(600);
   }, 30_000);
 
-  it("persists conversations across reloads (after unlocking)", async () => {
+  it("persists conversations across reloads, opening without a password", async () => {
     await page.reload();
-    await page.getByLabel("Password").fill("wrong password!");
-    await page.getByRole("button", { name: "Unlock" }).click();
-    await page.getByText("Incorrect password.").waitFor({ timeout: 15_000 });
-    await page.getByLabel("Password").fill(PASSWORD);
-    await page.getByRole("button", { name: "Unlock" }).click();
     await page.locator(".conv-title").first().click();
     await expect(page.locator(".msg.user .bubble").first().textContent()).resolves.toBe("hello there");
     expect(await page.locator(".msg").count()).toBe(6);
@@ -176,8 +180,6 @@ describe("static web client", () => {
     const ctx = await browser.newContext();
     const p2 = await ctx.newPage();
     await p2.goto(buildPairingUrl(baseUrl, { workerPubkey: worker.pubkey, relays: [relay.url], name: "Test Box" }));
-    await createIdentity(p2);
-    await p2.getByRole("dialog").getByRole("button", { name: "Add worker" }).click();
     await p2.getByRole("heading", { name: "Access approval required" }).waitFor({ timeout: 15_000 });
     expect(await p2.getByPlaceholder("Message…").count()).toBe(0);
     expect(provider.chats.length).toBe(3);
@@ -273,8 +275,6 @@ describe("static web client", () => {
 
     // Persisted (encrypted) across a reload.
     await page.reload();
-    await page.getByLabel("Password").fill(PASSWORD);
-    await page.getByRole("button", { name: "Unlock" }).click();
     await page.locator(".conv-title", { hasText: "ahoy" }).click();
     await expect(chip.textContent()).resolves.toContain("You are a pirate captain.");
     expect(await page.evaluate(() => localStorage.getItem("relayllm.prefs.v1") ?? "")).not.toContain("pirate");
@@ -285,8 +285,6 @@ describe("static web client", () => {
     const p4 = await ctx.newPage();
     const invite = createInvite(config, 600, "metrics");
     await p4.goto(buildPairingUrl(baseUrl, { workerPubkey: worker.pubkey, relays: [relay.url], name: "Test Box", invite }));
-    await createIdentity(p4);
-    await p4.getByRole("dialog").getByRole("button", { name: "Add worker" }).click();
     await p4.getByPlaceholder("Message…").waitFor({ timeout: 15_000 });
 
     const indicator = p4.getByRole("button", { name: "Context usage" });
@@ -333,32 +331,35 @@ describe("static web client", () => {
     await ctx.close();
   }, 60_000);
 
-  it("explains the password requirements while creating an identity", async () => {
+  it("creates an identity in one click without an invitation, and backs it up from Settings", async () => {
     const ctx = await browser.newContext();
     const p5 = await ctx.newPage();
     await p5.goto(baseUrl);
+    expect(await p5.locator("input[type=password]").count()).toBe(0);
     await p5.getByRole("button", { name: "Create a new identity" }).click();
-    const create = p5.getByRole("button", { name: "Create identity" });
-    const pw = p5.getByLabel("Password (protects your key in this browser)");
-    await expect(p5.locator("#pw-hint").textContent()).resolves.toBe("At least 8 characters");
-    expect(await create.isDisabled()).toBe(true);
-    await expect(p5.getByText("Password needs at least 8 characters to continue.").count()).resolves.toBe(1);
-
-    await pw.fill("abcde");
-    await expect(p5.locator("#pw-hint").textContent()).resolves.toBe("At least 8 characters (3 more)");
-    await pw.fill("abcdefgh");
-    await expect(p5.locator("#pw-hint").textContent()).resolves.toBe("✓ At least 8 characters");
-    await expect(p5.getByText("Repeat the password to continue.").count()).resolves.toBe(1);
-
-    await p5.getByLabel("Repeat password").fill("abcdefgX");
-    await expect(p5.getByText("Passwords don’t match yet").count()).resolves.toBe(1);
-    await expect(p5.getByText("Make both passwords match to continue.").count()).resolves.toBe(1);
-    expect(await create.isDisabled()).toBe(true);
-    await p5.getByLabel("Repeat password").fill("abcdefgh");
-    expect(await create.isEnabled()).toBe(true);
-    await expect(p5.getByText("to continue.").count()).resolves.toBe(0);
+    await p5.getByRole("button", { name: "Settings" }).click();
+    expect(await p5.getByRole("button", { name: "Lock" }).count()).toBe(0);
+    await p5.getByRole("button", { name: "Show nsec (backup)" }).click();
+    await expect(p5.locator(".secret-box .mono").textContent()).resolves.toMatch(/^nsec1/);
     await ctx.close();
   });
+
+  it("still unlocks an older password identity, then applies the invitation without questions", async () => {
+    const ctx = await browser.newContext();
+    const legacy = legacyIdentity();
+    await ctx.addInitScript((v) => localStorage.setItem("relayllm.identity.v1", v), legacy.stored);
+    const p6 = await ctx.newPage();
+    await p6.goto(buildPairingUrl(baseUrl, { workerPubkey: worker.pubkey, relays: [relay.url], name: "Test Box", invite: createInvite(config, 600, "legacy") }));
+    await p6.getByLabel("Password").fill("wrong password!");
+    await p6.getByRole("button", { name: "Unlock" }).click();
+    await p6.getByText("Incorrect password.").waitFor({ timeout: 15_000 });
+    await p6.getByLabel("Password").fill(PASSWORD);
+    await p6.getByRole("button", { name: "Unlock" }).click();
+    await p6.getByPlaceholder("Message…").waitFor({ timeout: 15_000 });
+    expect(await p6.getByRole("dialog").count()).toBe(0);
+    expect(config.access.users.some((u) => u.pubkey === legacy.pubkey)).toBe(true);
+    await ctx.close();
+  }, 60_000);
 
   it("controls reasoning, shows live progress, and explains interrupted or cut-off replies", async () => {
     const ctx = await browser.newContext();
@@ -366,8 +367,6 @@ describe("static web client", () => {
     const errors: string[] = [];
     p.on("pageerror", (e) => errors.push(e.message));
     await p.goto(buildPairingUrl(baseUrl, { workerPubkey: worker.pubkey, relays: [relay.url], name: "Test Box", invite: createInvite(config, 600, "reasoning") }));
-    await createIdentity(p);
-    await p.getByRole("dialog").getByRole("button", { name: "Add worker" }).click();
     await p.getByPlaceholder("Message…").waitFor({ timeout: 15_000 });
     const script = (fn: () => Iterable<MockStep>) => (provider.opts.script = fn);
     const state = p.locator(".gen-state");
@@ -449,8 +448,6 @@ describe("static web client", () => {
     await p.waitForTimeout(1800); // text is saved periodically
     const orphan = provider.chats.at(-1)!;
     await p.reload();
-    await p.getByLabel("Password").fill(PASSWORD);
-    await p.getByRole("button", { name: "Unlock" }).click();
     await expect.poll(() => orphan.aborted, { timeout: 10_000 }).toBe(true);
     await p.locator(".conv-title").first().click();
     await lastMsg.getByText("Interrupted. The partial answer was kept.").waitFor();

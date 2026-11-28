@@ -27,6 +27,7 @@
     "@relayllm/test-utils": "workspace:*",
     "@types/node": "^26.6.6",
     "esbuild": "^0.28.2",
+    "nostr-tools": "^2.26.1",
     "playwright": "^1.65.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
